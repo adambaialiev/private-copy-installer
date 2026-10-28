@@ -1,6 +1,6 @@
 {
   "name": "private-copy-installer",
-  "description": "Installs and upgrades a private copy of Agentic Cloud Computer in your own Fly.io organization.",
+  "description": "Installs and upgrades your own Agentic Cloud: the whole of Agentic Cloud Computer, in your own Fly.io organization.",
   "private": true,
   "type": "module",
   "license": "Apache-2.0",
