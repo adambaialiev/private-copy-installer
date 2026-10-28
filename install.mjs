@@ -29,6 +29,29 @@
  * the master key (once). What it made is recorded in ./<prefix>-copy.json,
  * names and addresses only, which the upgrade command reads.
  *
+ * `install --plan`, with the same flags, changes nothing and costs nothing:
+ * it makes every check the install makes before it creates anything (Node,
+ * flyctl and its sign-in, the organization and its bill, the domain, the
+ * update key and the release it opens, the licence, mail out), and lists
+ * everything the install would create with Fly's list price, and the DNS
+ * records it will ask for. It writes no file, not even its state or a log.
+ *
+ *   node install.mjs status [--state <file>] [--resend-key-file <file>]
+ *
+ * `status` only looks: it asks the domain's own name servers for each record,
+ * Fly for each certificate and the mail receiver for its own, and says what
+ * is still missing. It never creates, restarts or nudges anything.
+ *
+ * With --json, stdout carries one JSON object per line: progress, then the
+ * result, always the last line. The readable lines stay on stderr. No line
+ * on either holds a key: with --json, the first admin's link and the master
+ * key go to ./<prefix>-handover.txt (mode 600) instead of the screen.
+ *
+ * Exit codes: 0 done, 1 failed, 2 the command was wrong, 3 a person is
+ * needed (the result's `reason` says for what), 4 still waiting on Fly, Let's
+ * Encrypt or the mail provider, with nothing for anyone to do but run the
+ * same command again later.
+ *
  *   node install.mjs copy --customer <id> --key-file <update key file> \
  *        --to-app <the copy's images app> [--release <version|latest>]
  *
@@ -39,7 +62,7 @@
  * dated on or before its end date.
  */
 import {
-  appendFileSync, createReadStream, createWriteStream, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync,
+  appendFileSync, chmodSync, createReadStream, createWriteStream, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
@@ -65,12 +88,57 @@ const MANIFEST_TYPES = [
 const say = (line) => process.stderr.write(`${line}\n`);
 const basic = (user, password) => `Basic ${Buffer.from(`${user}:${password}`).toString('base64')}`;
 
+/** Not a failure: something only a person can do, such as adding the DNS
+ *  records, handing over a file from us, or settling a Fly bill. Exit 3,
+ *  with a `reason` a program can read and the details it needs. */
+export class PersonNeeded extends Error {
+  constructor(reason, message, details = {}) {
+    super(message);
+    this.name = 'PersonNeeded';
+    this.reason = reason;
+    this.details = details;
+  }
+}
+
+/** Not a failure either: Fly, Let's Encrypt or the mail provider is still at
+ *  it, and nobody can hurry it. Exit 4: run the same command again later. */
+export class StillWaiting extends Error {
+  constructor(reason, message, details = {}) {
+    super(message);
+    this.name = 'StillWaiting';
+    this.reason = reason;
+    this.details = details;
+  }
+}
+
+/** The command itself was wrong: a flag missing or two that clash. Exit 2. */
+export class UsageError extends Error {}
+
+export const EXIT = { done: 0, failed: 1, usage: 2, person: 3, waiting: 4 };
+
+export function exitCodeOf(error) {
+  if (error instanceof PersonNeeded) return EXIT.person;
+  if (error instanceof StillWaiting) return EXIT.waiting;
+  if (error instanceof UsageError) return EXIT.usage;
+  return EXIT.failed;
+}
+
+/** The last line a command prints with --json when it stopped. */
+export function resultOf(error) {
+  const outcome = error instanceof PersonNeeded ? 'needs-person' : error instanceof StillWaiting ? 'waiting' : 'failed';
+  return { event: 'result', outcome, exitCode: exitCodeOf(error), reason: error.reason ?? null, message: error.message, ...(error.details ?? {}) };
+}
+
+const jsonLine = (event) => process.stdout.write(`${JSON.stringify(event)}\n`);
+/** Where a command's events go: a test's own list, stdout with --json, or nowhere. */
+const eventSink = (options, deps) => deps.emit ?? (options.json ? jsonLine : () => {});
+
 /** Where releases come from: our update service, signed in as the customer. */
 export function updatesSource({ url = UPDATES_URL, customer, key, fetchImpl = fetch }) {
   const auth = basic(customer, key);
   const get = async (pathname, init = {}) => {
     const answer = await fetchImpl(`${url}${pathname}`, { ...init, headers: { authorization: auth, ...(init.headers ?? {}) } });
-    if (answer.status === 401) throw new Error('The update service did not accept this customer id and update key.');
+    if (answer.status === 401) throw new PersonNeeded('update-key', 'The update service did not accept this customer id and update key.');
     return answer;
   };
   return {
@@ -189,6 +257,29 @@ const FLY_GRAPHQL = 'https://api.fly.io/graphql';
 const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
 const lastLines = (text, n = 6) => String(text ?? '').trim().split('\n').slice(-n).join('\n');
 
+// What a person is asked for, in the same words wherever it is asked.
+const ORG_NEEDED = '--org is the Fly organization your own Agentic Cloud goes into (its slug, as `fly orgs list` shows). Its bill pays for every machine, so the person who owns it chooses.';
+const DOMAIN_NEEDED = '--domain is the name your own Agentic Cloud lives on, like agents.theirco.com: a name of its own, not the company\'s main domain.';
+const PREFIX_NEEDED = '--name is a short lowercase prefix for its app names, like theirco.';
+const NO_TOKEN = 'No Fly token: set FLY_API_TOKEN, or sign in with `fly auth login`.';
+const keyForAnotherDomain = (updateKey, domain) => `This update key was issued for ${updateKey.domain}, not ${domain}. Ask us for a key for ${domain}, or use that domain.`;
+
+/** Mail out goes one way or none, and its key is a file the person gives.
+ *  Says how mail will go out, or throws what is wrong. */
+export function mailOutProblem(options) {
+  const smtpHost = options['smtp-host'] ? String(options['smtp-host']).trim() : '';
+  const resendFile = options['resend-key-file'];
+  if (smtpHost && resendFile) throw new UsageError('Mail out goes one way: --resend-key-file or --smtp-host, not both.');
+  if (smtpHost && options['smtp-user'] && !options['smtp-password-file']) throw new UsageError('--smtp-user needs --smtp-password-file.');
+  for (const [flag, file] of [['--resend-key-file', resendFile], ['--smtp-password-file', options['smtp-password-file']]]) {
+    if (file === true) throw new UsageError(`${flag} needs a file.`);
+    if (file && !existsSync(file)) throw new PersonNeeded('mail-key', `There is no file at ${file} (${flag}). The mail-sending key is the person's own, from their provider; mail out can also be added later.`);
+  }
+  if (resendFile) return 'through Resend; the install registers the domain there and waits for it';
+  if (smtpHost) return `through ${smtpHost} over SMTP; that provider's own SPF and DKIM records are added by hand`;
+  return 'not set up: everything else works without it, and it can be added later with --resend-key-file or --smtp-host';
+}
+
 /** What an update key says about itself: who it was issued to and for which
  *  domain. The update service checks the signature; this only reads. */
 export function readUpdateKey(text) {
@@ -199,6 +290,38 @@ export function readUpdateKey(text) {
   try { payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')); } catch { /* damaged, below */ }
   if (payload?.kind !== 'update' || !payload.customer || !payload.domain) throw new Error('That update key is damaged. Ask us for the file again.');
   return { key, customer: payload.customer, domain: payload.domain, until: payload.updatesUntil };
+}
+
+/** The update key from its file. It comes from us with the agreement, so a
+ *  missing or damaged one is for a person to fetch, not a failure. */
+export function readKeyFile(file) {
+  const fromUs = 'It comes from us with the agreement, one line in a file.';
+  if (!file || file === true) throw new PersonNeeded('update-key', `The install needs its update key: --key-file <file>. ${fromUs}`);
+  if (!existsSync(file)) throw new PersonNeeded('update-key', `There is no update key at ${file}. ${fromUs}`);
+  try {
+    return readUpdateKey(readFileSync(file, 'utf8'));
+  } catch (error) {
+    throw new PersonNeeded('update-key', error.message);
+  }
+}
+
+/** The licence, or its deliberate absence (--no-licence). Read for its
+ *  domain only: the installed backend checks the signature itself. A run
+ *  that carries on from a state file already stored it. */
+export function readLicence(options, domain, { resuming = false } = {}) {
+  if (options['licence-file'] && options['licence-file'] !== true) {
+    const file = options['licence-file'];
+    if (!existsSync(file)) throw new PersonNeeded('licence', `There is no licence at ${file}. It comes from us with the agreement, one line in a file.`);
+    const text = readFileSync(file, 'utf8').trim();
+    let payload = null;
+    try { payload = JSON.parse(Buffer.from(text.split('.')[1] ?? '', 'base64url').toString('utf8')); } catch { /* below */ }
+    if (payload?.kind !== 'licence') throw new PersonNeeded('licence', 'That file does not hold a licence. Ask us for the licence file.');
+    if (payload.domain !== domain) throw new PersonNeeded('licence', `This licence was issued for ${payload.domain}, not ${domain}.`);
+    return { text, detail: `for ${payload.people ?? 'any number of'} people at ${payload.domain}, until ${payload.ends ?? 'no end date'}` };
+  }
+  if (options['no-licence']) return { text: null, detail: 'none, by --no-licence (only when the agreement says so)' };
+  if (resuming) return { text: null, detail: 'stored by an earlier run' };
+  throw new PersonNeeded('licence', 'Your own Agentic Cloud needs its licence: --licence-file <file>. Run with --no-licence only if your contract says it has none.');
 }
 
 /** Everything a copy is made of, named from one prefix. Fly app names are
@@ -214,6 +337,23 @@ export function namesFor(prefix) {
     backups: `${prefix}-backups`,
   };
 }
+
+/** Each app's machine and disk: what appConfigs writes, and what --plan
+ *  prices, from this one table. */
+export const SHAPES = {
+  backend: { size: 'shared-cpu-2x', cpus: 2, memory: '2gb', mb: 2048, diskGb: 3 },
+  git: { size: 'shared-cpu-1x', cpus: 1, memory: '512mb', mb: 512, diskGb: 3 },
+  router: { size: 'shared-cpu-1x', cpus: 1, memory: '256mb', mb: 256 },
+  mx: { size: 'shared-cpu-1x', cpus: 1, memory: '256mb', mb: 256, diskGb: 1 },
+};
+
+/** Fly's published prices, as estimates (Fly's dashboard has the real bill):
+ *  a shared core with 256 MB is $1.94 a month and each GB beyond it $5, a
+ *  disk $0.15 per GB, a dedicated IPv4 $2, and an agent's machine
+ *  (performance-2x, 4 GB) about $0.09 an hour while it is awake. */
+const PRICE = { sharedCore: 1.94, ramGb: 5, includedGbPerCore: 0.25, diskGb: 0.15, ipv4: 2, agentHour: 0.09 };
+const cents = (usd) => Math.round(usd * 100) / 100;
+export const machineMonthlyUsd = ({ cpus, mb }) => cents(cpus * PRICE.sharedCore + Math.max(0, mb / 1024 - cpus * PRICE.includedGbPerCore) * PRICE.ramGb);
 
 const q = (value) => JSON.stringify(String(value));
 const envBlock = (env) => Object.entries(env).map(([name, value]) => `  ${name} = ${q(value)}`).join('\n');
@@ -263,7 +403,7 @@ export function appConfigs({ names, org, region, domain, tags, peerIp, version, 
     `app = ${q(app)}`,
     `primary_region = ${q(region)}`,
   ].join('\n');
-  const vm = (size, memory) => `[[vm]]\n  size = ${q(size)}\n  memory = ${q(memory)}`;
+  const vm = (shape) => `[[vm]]\n  size = ${q(shape.size)}\n  memory = ${q(shape.memory)}`;
   const check = (path, grace) => [
     '[[http_service.checks]]',
     `  grace_period = ${q(grace)}`,
@@ -293,10 +433,10 @@ export function appConfigs({ names, org, region, domain, tags, peerIp, version, 
       head(names.backend, 'The Workspace and everything behind it'),
       'kill_signal = "SIGTERM"\nkill_timeout = "30s"',
       `[env]\n${envBlock(backendEnv({ names, org, region, domain, tags, peerIp, version, extra: extraEnv.backend }))}`,
-      mount('backend_data', '3gb'),
+      mount('backend_data', `${SHAPES.backend.diskGb}gb`),
       `${http(true)}\n  [http_service.concurrency]\n    type = "requests"\n    soft_limit = 200\n    hard_limit = 250`,
       check('/api/health', '60s'),
-      vm('shared-cpu-2x', '2gb'),
+      vm(SHAPES.backend),
     ].join('\n\n'),
     git: [
       head(names.git, 'The code host'),
@@ -308,16 +448,16 @@ export function appConfigs({ names, org, region, domain, tags, peerIp, version, 
         CI_WEBHOOK_URL: `https://${domain}/api/agent-cli/git/ci-webhook`,
         COMMIT_EMAIL: `noreply@${domain}`,
       })}`,
-      mount('git_data', '3gb'),
+      mount('git_data', `${SHAPES.git.diskGb}gb`),
       http(false),
-      vm('shared-cpu-1x', '512mb'),
+      vm(SHAPES.git),
     ].join('\n\n'),
     router: [
       head(names.router, 'Previews and sites on *.' + domain),
       `[env]\n${envBlock({ APPS_DOMAIN: domain, BACKEND_URL: internal, PORT: '8080' })}`,
       http(true),
       check('/__router/health', '10s'),
-      vm('shared-cpu-1x', '256mb'),
+      vm(SHAPES.router),
     ].join('\n\n'),
     mx: [
       head(names.mx, 'The mail receiver'),
@@ -357,8 +497,8 @@ export function appConfigs({ names, org, region, domain, tags, peerIp, version, 
         '    port = 80',
         '    handlers = ["http"]',
       ].join('\n'),
-      mount('mx_data', '1gb', false),
-      vm('shared-cpu-1x', '256mb'),
+      mount('mx_data', `${SHAPES.mx.diskGb}gb`, false),
+      vm(SHAPES.mx),
     ].join('\n\n'),
   };
 }
@@ -385,6 +525,11 @@ export function formatRecords(records) {
     return `  ${record.name.padEnd(width)}  ${record.type.padEnd(5)}  ${value}`;
   }).join('\n');
 }
+
+/** One record as --json shows it: exactly what to add, and why. */
+const publicRecord = (record) => ({
+  name: record.name, type: record.type, value: record.value, ...(record.priority !== undefined ? { priority: record.priority } : {}), why: record.why,
+});
 
 const bareHost = (value) => String(value ?? '').trim().replace(/\.$/, '').toLowerCase();
 const sameAddress = (a, b) => {
@@ -454,6 +599,9 @@ export function flyRunner({ bin, token, logFile }) {
       if (code === 0) return resolve(out);
       reject(new Error(`fly ${args.slice(0, 2).join(' ')}: ${lastLines(err || (quiet ? '' : out)) || `exit ${code}`}`));
     });
+    // A flyctl that exits without reading its input (most commands) must
+    // not crash the installer with EPIPE: its exit code says how it went.
+    child.stdin.on('error', () => {});
     child.stdin.end(input ?? '');
   });
 }
@@ -489,13 +637,14 @@ export async function checkOrganization(token, org, fetchImpl = fetch) {
   try {
     data = await flyGraphql(token, 'query($slug: String!) { organization(slug: $slug) { slug name billable billingStatus } nearestRegion { code } }', { slug: org }, fetchImpl);
   } catch (error) {
-    throw new Error(`Fly did not show the organization ${org} to this token (${error.message}). Use a token of that organization.`);
+    throw new PersonNeeded('fly-organization', `Fly did not show the organization ${org} to this token (${error.message}). Use a token of that organization.`);
   }
   const found = data?.organization;
-  if (!found) throw new Error(`There is no Fly organization ${org} for this token.`);
-  if (!found.billable) throw new Error(`The organization ${org} has no card on file. Your own Agentic Cloud needs one (its mail address is a dedicated IPv4). Add it at fly.io/dashboard/${org}/billing and run this again.`);
+  if (!found) throw new PersonNeeded('fly-organization', `There is no Fly organization ${org} for this token.`);
+  const billing = { billingUrl: `https://fly.io/dashboard/${org}/billing` };
+  if (!found.billable) throw new PersonNeeded('billing', `The organization ${org} has no card on file. Your own Agentic Cloud needs one (its mail address is a dedicated IPv4). Add it at fly.io/dashboard/${org}/billing and run this again.`, billing);
   if (found.billingStatus !== 'CURRENT') {
-    throw new Error(`Fly says the organization ${org}'s bill is not paid (${String(found.billingStatus).toLowerCase().replace('_', ' ')}), and it refuses to create anything until it is. Settle it at fly.io/dashboard/${org}/billing and run this again.`);
+    throw new PersonNeeded('billing', `Fly says the organization ${org}'s bill is not paid (${String(found.billingStatus).toLowerCase().replace('_', ' ')}), and it refuses to create anything until it is. Settle it at fly.io/dashboard/${org}/billing and run this again.`, billing);
   }
   return { name: found.name, nearestRegion: data.nearestRegion?.code ?? null };
 }
@@ -563,6 +712,10 @@ export function resendProvider({ key, fetchImpl = fetch, base = 'https://api.res
       const made = existing ? await call('GET', `/domains/${existing.id}`) : await call('POST', '/domains', { name: domain });
       const id = made.id ?? existing?.id;
       return { id, records: records(domain, made.records ?? (await call('GET', `/domains/${id}`)).records) };
+    },
+    /** Only reads: unlike verified(), it never asks Resend to check again. */
+    async status(id) {
+      return (await call('GET', `/domains/${id}`)).status;
     },
     async verified(id) {
       const found = await call('GET', `/domains/${id}`);
@@ -649,34 +802,24 @@ const minutes = (ms) => `${Math.floor(ms / 60_000)} min ${Math.round((ms % 60_00
  */
 export async function install(options, deps = {}) {
   const log = deps.say ?? say;
+  const emit = eventSink(options, deps);
   const started = Date.now();
   const fetchImpl = deps.fetchImpl ?? fetch;
   const nodeMajor = Number(process.versions.node.split('.')[0]);
   if (nodeMajor < 20) throw new Error(`Node ${process.versions.node} is too old; the installer needs 20 or newer.`);
 
-  const updateKey = readUpdateKey(readFileSync(options['key-file'], 'utf8'));
+  const updateKey = readKeyFile(options['key-file']);
   const domain = String(options.domain ?? '').toLowerCase().replace(/\.$/, '');
   const org = String(options.org ?? '');
-  if (!org) throw new Error('--org is the Fly organization your own Agentic Cloud goes into (its slug, as `fly orgs list` shows).');
-  if (!DOMAIN_SHAPE.test(domain)) throw new Error('--domain is the name your own Agentic Cloud lives on, like agents.theirco.com.');
-  if (updateKey.domain !== domain) throw new Error(`This update key was issued for ${updateKey.domain}, not ${domain}. Ask us for a key for ${domain}, or use that domain.`);
+  if (!org) throw new PersonNeeded('fly-organization', ORG_NEEDED);
+  if (!DOMAIN_SHAPE.test(domain)) throw new PersonNeeded('domain', DOMAIN_NEEDED);
+  if (updateKey.domain !== domain) throw new PersonNeeded('update-key', keyForAnotherDomain(updateKey, domain));
   const smtpHost = options['smtp-host'] ? String(options['smtp-host']).trim() : '';
-  if (smtpHost && options['resend-key-file']) throw new Error('Mail out goes one way: --resend-key-file or --smtp-host, not both.');
-  if (smtpHost && options['smtp-user'] && !options['smtp-password-file']) throw new Error('--smtp-user needs --smtp-password-file.');
-  // The licence, or its deliberate absence. Read for its domain
-  // only: the copy itself checks the signature.
-  let licenceText = null;
-  if (options['licence-file']) {
-    licenceText = readFileSync(options['licence-file'], 'utf8').trim();
-    let payload = null;
-    try { payload = JSON.parse(Buffer.from(licenceText.split('.')[1] ?? '', 'base64url').toString('utf8')); } catch { /* below */ }
-    if (payload?.kind !== 'licence') throw new Error('That file does not hold a licence. Ask us for the licence file.');
-    if (payload.domain !== domain) throw new Error(`This licence was issued for ${payload.domain}, not ${domain}.`);
-  } else if (!options['no-licence'] && !existsSync(path.resolve(options.state ?? `${String(options.name ?? updateKey.customer).toLowerCase()}-copy.json`))) {
-    throw new Error('Your own Agentic Cloud needs its licence: --licence-file <file>. Run with --no-licence only if your contract says it has none.');
-  }
+  mailOutProblem(options);
   const prefix = String(options.name ?? updateKey.customer).toLowerCase();
-  if (!PREFIX_SHAPE.test(prefix)) throw new Error('--name is a short lowercase prefix for its app names, like theirco.');
+  const licence = readLicence(options, domain, { resuming: existsSync(path.resolve(options.state ?? `${prefix}-copy.json`)) });
+  const licenceText = licence.text;
+  if (!PREFIX_SHAPE.test(prefix)) throw new UsageError(PREFIX_NEEDED);
   const names = namesFor(prefix);
 
   const stateFile = path.resolve(options.state ?? `${prefix}-copy.json`);
@@ -692,20 +835,24 @@ export async function install(options, deps = {}) {
   let token = deps.token ?? process.env.FLY_API_TOKEN ?? '';
   const fly = deps.fly ?? ((args, opts) => flyRunner({ bin, token, logFile })(args, opts));
   if (!token) token = (await fly(['auth', 'token'], { quiet: true })).trim();
-  if (!token) throw new Error('No Fly token: set FLY_API_TOKEN, or sign in with `fly auth login`.');
+  if (!token) throw new PersonNeeded('fly-sign-in', NO_TOKEN);
 
   let stepNumber = 0;
   const STEPS = 11;
   const step = async (key, title, run) => {
     stepNumber += 1;
     const label = `[${String(stepNumber).padStart(2)}/${STEPS}] ${title}`;
-    if (state.steps[key]) { log(`${label}: done before`); return; }
+    const said = { event: 'step', step: stepNumber, of: STEPS, key, title };
+    if (state.steps[key]) { log(`${label}: done before`); emit({ ...said, status: 'done-before' }); return; }
     const at = Date.now();
     log(`${label}…`);
+    emit({ ...said, status: 'running' });
     await run();
     state.steps[key] = new Date().toISOString();
     save();
-    log(`${' '.repeat(8)}done in ${((Date.now() - at) / 1000).toFixed(0)} s`);
+    const seconds = Math.round((Date.now() - at) / 1000);
+    log(`${' '.repeat(8)}done in ${seconds} s`);
+    emit({ ...said, status: 'done', seconds });
   };
   const setSecrets = async (app, values) => {
     const lines = Object.entries(values).map(([name, value]) => `${name}=${String(value).replace(/\n/g, '\\n')}`).join('\n');
@@ -720,12 +867,14 @@ export async function install(options, deps = {}) {
   // 1. Before anything is made: the organization can pay, the key opens a release.
   stepNumber += 1;
   log(`[ 1/${STEPS}] Checking the organization, the update key and the release…`);
+  emit({ event: 'step', step: 1, of: STEPS, key: 'checks', title: 'Checking the organization, the update key and the release', status: 'running' });
   const orgFacts = await checkOrganization(token, org, fetchImpl);
   state.region = state.region ?? options.region ?? orgFacts.nearestRegion ?? 'iad';
   const source = (deps.updatesSource ?? updatesSource)({ customer: updateKey.customer, key: updateKey.key, url: options.updates || UPDATES_URL, fetchImpl });
   const release = state.release ?? await source.release(options.release || 'latest');
   log(`        ${orgFacts.name}: billing current. Region ${state.region}. Release ${release.version}. Update key good for releases until ${updateKey.until}.`);
   save();
+  emit({ event: 'step', step: 1, of: STEPS, key: 'checks', title: 'Checking the organization, the update key and the release', status: 'done', release: release.version, region: state.region });
 
   await step('apps', 'Creating the five apps', async () => {
     const listed = jsonList(await fly(['apps', 'list', '-o', org, '--json'])).map((app) => app.Name ?? app.name);
@@ -872,6 +1021,7 @@ export async function install(options, deps = {}) {
   });
   await step('dns', 'Waiting for the DNS records, the certificates and the mail domain', async () => {
     log(`\n  Add these ${records.length} records at ${domain}'s DNS provider, all DNS only (not proxied):\n\n${formatRecords(records)}\n`);
+    emit({ event: 'dns-records', domain, records: records.map(publicRecord), ...(state.sending?.provider === 'smtp' ? { alsoFromProvider: state.sending.host } : {}) });
     if (state.sending?.provider === 'smtp') {
       log(`  Also add the SPF and DKIM records ${state.sending.host} gives you for ${domain}: only that provider knows`);
       log('  them, so the installer does not wait for them. Without them mail out goes to spam.\n');
@@ -925,9 +1075,21 @@ export async function install(options, deps = {}) {
           : `mail certificate waiting (the receiver asks again by itself every 12 h, or now with: fly apps restart ${names.mx})`,
         ...(provider && state.sending?.provider === 'resend' ? [sendingReady ? 'mail out verified' : 'mail out waiting for Resend'] : []),
       ].join('; ');
-      if (line !== said) { log(`  ${new Date().toISOString().slice(11, 19)}  ${line}`); said = line; }
+      const where = {
+        missing: missing.map(publicRecord),
+        certificatesWaiting: certsWaiting,
+        mailCertificate: mailCert,
+        ...(provider && state.sending?.provider === 'resend' ? { mailOut: sendingReady ? 'verified' : 'waiting' } : {}),
+      };
+      if (line !== said) { log(`  ${new Date().toISOString().slice(11, 19)}  ${line}`); said = line; emit({ event: 'waiting', ...where }); }
       if (!missing.length && !certsWaiting.length && mailCert && sendingReady) break;
-      if (Date.now() > deadline) throw new Error('Still waiting for the line above. Nothing is lost: run the same command again to carry on.');
+      if (Date.now() > deadline) {
+        if (missing.length) {
+          throw new PersonNeeded('dns', `${missing.length} of ${records.length} DNS records are not in place at ${domain}'s name servers yet. Add them, all DNS only, then run the same command again: it carries on from here.`, { domain, records: missing.map(publicRecord), allRecords: records.map(publicRecord) });
+        }
+        const reason = certsWaiting.length ? 'certificates' : !mailCert ? 'mail-certificate' : 'mail-out';
+        throw new StillWaiting(reason, `Every DNS record is in; still waiting for ${certsWaiting.length ? `the certificates of ${certsWaiting.join(', ')}` : !mailCert ? 'the mail receiver\'s certificate' : 'Resend to verify the domain'}. Nobody needs to do anything. Run the same command again later: it carries on from here. Fly can take over an hour for one certificate.`, where);
+      }
       await sleep(deps.pollMs ?? 15_000);
     }
   });
@@ -939,23 +1101,73 @@ export async function install(options, deps = {}) {
   });
 
   const shown = state.pending ?? {};
+  // With --json the two secrets go to a file only its owner can read, never
+  // onto a screen or into a program's output: an agent hands the file over.
+  const handoverFile = options.json && (shown.FIRST_ACCOUNT_CODE || shown.SECRETS_MASTER_KEY)
+    ? path.join(path.dirname(stateFile), `${prefix}-handover.txt`) : null;
   log(`\nYour own Agentic Cloud is ready. This run took ${minutes(Date.now() - started)}.`);
   log(`\n  Sign-in address:  https://${domain}`);
-  if (shown.FIRST_ACCOUNT_CODE) {
-    log(`  First admin:      https://${domain}/signup#first-account=${shown.FIRST_ACCOUNT_CODE}`);
-    log('                    The first person to open it and sign up becomes the admin. It works once,');
-    log('                    and only while there is no account yet; everyone else joins by invite.');
-  }
-  if (shown.SECRETS_MASTER_KEY) {
-    log(`  Master key:       ${shown.SECRETS_MASTER_KEY}`);
-    log('                    Keep it offline, now: this is the only time it is shown. Without it a database');
-    log('                    restored into a new install cannot open the keys people saved in it.');
+  if (handoverFile) {
+    writeFileSync(handoverFile, handoverText(domain, shown), { mode: 0o600 });
+    chmodSync(handoverFile, 0o600);
+    log(`  First admin and master key: in ${handoverFile}, readable only by this user.`);
+    log('                    Give that file to the person who will be the admin. They open the link to');
+    log('                    become the admin, keep the master key offline, then delete the file.');
+  } else {
+    if (shown.FIRST_ACCOUNT_CODE) {
+      log(`  First admin:      https://${domain}/signup#first-account=${shown.FIRST_ACCOUNT_CODE}`);
+      log('                    The first person to open it and sign up becomes the admin. It works once,');
+      log('                    and only while there is no account yet; everyone else joins by invite.');
+    }
+    if (shown.SECRETS_MASTER_KEY) {
+      log(`  Master key:       ${shown.SECRETS_MASTER_KEY}`);
+      log('                    Keep it offline, now: this is the only time it is shown. Without it a database');
+      log('                    restored into a new install cannot open the keys people saved in it.');
+    }
   }
   if (!state.sending) log(`  Mail out:         not set up. Run again with --resend-key-file <file> or --smtp-host <host> to send as ${domain}.`);
   log(`  Kept here:        ${stateFile} (names and addresses, no keys); the upgrade command reads it.`);
   state.pending = {};
   save();
+  emit({
+    event: 'result',
+    outcome: 'done',
+    exitCode: EXIT.done,
+    command: 'install',
+    domain,
+    signInUrl: `https://${domain}`,
+    release: state.release?.version ?? null,
+    stateFile,
+    handoverFile,
+    mailOut: state.sending?.provider ?? null,
+    person: handoverFile ? [
+      `Open ${handoverFile}: the first-admin link in it makes the first admin, once.`,
+      'Keep the master key in it offline, then delete the file.',
+    ] : [],
+  });
   return state;
+}
+
+/** The file --json leaves for the admin instead of printing the two secrets. */
+function handoverText(domain, shown) {
+  return [
+    `Your own Agentic Cloud at https://${domain}`,
+    '',
+    ...(shown.FIRST_ACCOUNT_CODE ? [
+      'First admin. The first person to open this and sign up becomes the admin. It works once,',
+      'and only while there is no account yet; everyone else joins by invite:',
+      `  https://${domain}/signup#first-account=${shown.FIRST_ACCOUNT_CODE}`,
+      '',
+    ] : []),
+    ...(shown.SECRETS_MASTER_KEY ? [
+      'Master key. Keep it offline, now: this is the only time it is shown. Without it a database',
+      'restored into a new install cannot open the keys people saved in it:',
+      `  ${shown.SECRETS_MASTER_KEY}`,
+      '',
+    ] : []),
+    'Delete this file once the master key is kept somewhere safe.',
+    '',
+  ].join('\n');
 }
 
 /** Which image each app runs, and the order a release rolls through them. */
@@ -1014,14 +1226,15 @@ async function waitHealthy(url, fetchImpl, timeoutMs = 180_000) {
  */
 export async function upgrade(options, deps = {}) {
   const log = deps.say ?? say;
+  const emit = eventSink(options, deps);
   const started = Date.now();
   const fetchImpl = deps.fetchImpl ?? fetch;
-  const updateKey = readUpdateKey(readFileSync(options['key-file'], 'utf8'));
+  const updateKey = readKeyFile(options['key-file']);
   const stateFile = path.resolve(options.state ?? `${updateKey.customer}-copy.json`);
   if (!existsSync(stateFile)) throw new Error(`There is no ${stateFile}. Run this where the installer left it, or give --state <file>.`);
   const state = JSON.parse(readFileSync(stateFile, 'utf8'));
   if (!state.release?.tags || !state.steps?.smoke) throw new Error(`${stateFile} is not a finished install. Run the installer to the end first.`);
-  if (updateKey.domain !== state.domain) throw new Error(`This update key was issued for ${updateKey.domain}, not ${state.domain}.`);
+  if (updateKey.domain !== state.domain) throw new PersonNeeded('update-key', `This update key was issued for ${updateKey.domain}, not ${state.domain}.`);
   const save = () => writeFileSync(stateFile, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   const names = namesFor(state.prefix);
   const domain = state.domain;
@@ -1032,14 +1245,17 @@ export async function upgrade(options, deps = {}) {
   const logFile = path.resolve(`${state.prefix}-upgrade.log`);
   const fly = deps.fly ?? ((args, opts) => flyRunner({ bin, token, logFile })(args, opts));
   if (!token) token = (await fly(['auth', 'token'], { quiet: true })).trim();
-  if (!token) throw new Error('No Fly token: set FLY_API_TOKEN, or sign in with `fly auth login`.');
+  if (!token) throw new PersonNeeded('fly-sign-in', NO_TOKEN);
   const source = (deps.updatesSource ?? updatesSource)({ customer: updateKey.customer, key: updateKey.key, url: options.updates || UPDATES_URL, fetchImpl });
   const smoke = deps.smokeTest ?? smokeTest;
   const timed = async (title, run) => {
     const at = Date.now();
     log(`  ${title}…`);
+    emit({ event: 'step', title, status: 'running' });
     const result = await run();
-    log(`      done in ${((Date.now() - at) / 1000).toFixed(0)} s`);
+    const seconds = Math.round((Date.now() - at) / 1000);
+    log(`      done in ${seconds} s`);
+    emit({ event: 'step', title, status: 'done', seconds });
     return result;
   };
 
@@ -1051,6 +1267,7 @@ export async function upgrade(options, deps = {}) {
     const target = await source.release(options.release || 'latest');
     if (target.version === state.release.version && !options.drill) {
       log(`${domain} already runs release ${target.version}; nothing to do.`);
+      emit({ event: 'result', outcome: 'done', exitCode: EXIT.done, command: 'upgrade', domain, release: target.version, unchanged: true });
       return state;
     }
     run = { from: state.release, toVersion: target.version, drill: Boolean(options.drill), startedAt: new Date().toISOString() };
@@ -1085,6 +1302,7 @@ export async function upgrade(options, deps = {}) {
   if (run.phase === 'rolling-back') {
     await rollBack('An earlier run was rolling back when it stopped.');
     log(`\n${domain} is back on ${run.from.version} (${minutes(Date.now() - started)}).`);
+    emit({ event: 'result', outcome: 'done', exitCode: EXIT.done, command: 'upgrade', domain, release: run.from.version, rolledBack: true });
     return state;
   }
 
@@ -1142,6 +1360,7 @@ export async function upgrade(options, deps = {}) {
     await rollBack(error.message);
     if (run.drill) {
       log(`\nDrill done: ${domain} went to ${run.to.version}, came back to ${run.from.version} with its database as it was, in ${minutes(Date.now() - started)}.`);
+      emit({ event: 'result', outcome: 'done', exitCode: EXIT.done, command: 'upgrade', domain, release: run.from.version, drill: true, rehearsed: run.to.version });
       return state;
     }
     throw new Error(`The upgrade to ${run.to.version} failed and ${domain} is back on ${run.from.version} (${minutes(Date.now() - started)}).`);
@@ -1153,7 +1372,279 @@ export async function upgrade(options, deps = {}) {
   save();
   log(`\n${domain} runs release ${run.to.version}. This upgrade took ${minutes(Date.now() - started)}.`);
   log(`  The database as it was before is ${run.snapshot.file} on ${names.backend}, until the next upgrade.`);
+  emit({ event: 'result', outcome: 'done', exitCode: EXIT.done, command: 'upgrade', domain, release: run.to.version, previous: run.from.version });
   return state;
+}
+
+/** The install's steps, in order, as its state file records them. */
+export const INSTALL_STEPS = ['apps', 'release', 'buckets', 'keys', 'secrets', 'addresses', 'deploy', 'certificates', 'dns', 'smoke'];
+
+const usd = (value) => (value === null ? 'by use' : `$${value.toFixed(2)}`);
+
+/**
+ * What `install` would do, changing nothing: the checks it makes before it
+ * creates anything, everything it would create with Fly's list price, and
+ * the DNS records it will ask for. It only reads (flyctl's sign-in, the
+ * organization and its bill, the release the update key opens, the apps
+ * already there) and writes no file, not even its state or a log. Every
+ * problem says who fixes it: "you" (whoever runs this) or "person" (the one
+ * who owns the Fly organization, the domain and the agreement with us).
+ */
+export async function plan(options, deps = {}) {
+  const log = deps.say ?? say;
+  const emit = eventSink(options, deps);
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  const domain = String(options.domain ?? '').toLowerCase().replace(/\.$/, '');
+  const org = typeof options.org === 'string' ? options.org : '';
+  const checks = [];
+  const check = async (key, run) => {
+    try {
+      checks.push({ key, ok: true, detail: await run() });
+      return true;
+    } catch (error) {
+      const person = error instanceof PersonNeeded;
+      checks.push({ key, ok: false, who: person ? 'person' : 'you', reason: error.reason ?? null, detail: error.message, ...(error.details ?? {}) });
+      return false;
+    }
+  };
+
+  await check('node', async () => {
+    if (Number(process.versions.node.split('.')[0]) < 20) throw new Error(`Node ${process.versions.node} is too old; the installer needs 20 or newer.`);
+    return `Node ${process.versions.node}`;
+  });
+  const domainOk = await check('domain', async () => {
+    if (!DOMAIN_SHAPE.test(domain)) throw new PersonNeeded('domain', DOMAIN_NEEDED);
+    return domain;
+  });
+  let updateKey = null;
+  await check('update-key', async () => {
+    const read = readKeyFile(options['key-file']);
+    if (domainOk && read.domain !== domain) throw new PersonNeeded('update-key', keyForAnotherDomain(read, domain));
+    updateKey = read;
+    return `for ${read.customer} at ${read.domain}, releases until ${read.until}`;
+  });
+  const prefix = String(options.name ?? updateKey?.customer ?? '').toLowerCase();
+  const names = PREFIX_SHAPE.test(prefix) ? namesFor(prefix) : null;
+  const stateFile = path.resolve(options.state ?? `${prefix || 'install'}-copy.json`);
+  const state = names && existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, 'utf8')) : null;
+  if (updateKey || options.name) {
+    await check('name', async () => {
+      if (!names) throw new UsageError(PREFIX_NEEDED);
+      return `every app is named ${prefix}-*`;
+    });
+  }
+  if (domainOk) await check('licence', async () => readLicence(options, domain, { resuming: Boolean(state) }).detail);
+  await check('mail-out', async () => mailOutProblem(options));
+
+  const bin = deps.flyctl ?? findFlyctl();
+  let token = deps.token ?? process.env.FLY_API_TOKEN ?? '';
+  // No log file: a plan leaves nothing behind.
+  const fly = deps.fly ?? ((args, opts) => flyRunner({ bin, token })(args, opts));
+  const flyOk = await check('flyctl', async () => {
+    if (!bin) throw new Error('flyctl is not installed. Install it (fly.io/docs/flyctl/install) and run this again.');
+    return bin;
+  });
+  const signedIn = flyOk && await check('fly-sign-in', async () => {
+    const fromEnv = Boolean(token);
+    if (!token) token = (await fly(['auth', 'token'], { quiet: true }).catch(() => '')).trim();
+    if (!token) throw new PersonNeeded('fly-sign-in', `${NO_TOKEN} The sign-in opens a browser, so the person signs in.`);
+    return fromEnv ? 'a Fly token is set' : 'flyctl is signed in';
+  });
+  let orgOk = false;
+  if (signedIn) {
+    orgOk = await check('fly-organization', async () => {
+      if (!org) {
+        let organizations = [];
+        try {
+          const listed = JSON.parse(await fly(['orgs', 'list', '--json']) || '{}');
+          organizations = Array.isArray(listed) ? listed.map((entry) => entry.slug ?? entry.Slug).filter(Boolean) : Object.keys(listed);
+        } catch { /* the person knows */ }
+        throw new PersonNeeded('fly-organization', ORG_NEEDED, { organizations });
+      }
+      const facts = await checkOrganization(token, org, fetchImpl);
+      return `${facts.name}: card on file, billing current`;
+    });
+  }
+  let release = null;
+  if (updateKey) {
+    await check('release', async () => {
+      const source = (deps.updatesSource ?? updatesSource)({ customer: updateKey.customer, key: updateKey.key, url: options.updates || UPDATES_URL, fetchImpl });
+      release = await source.release(options.release || 'latest');
+      return `release ${release.version}, which this update key opens`;
+    });
+  }
+  let existing = [];
+  if (names && orgOk) {
+    await check('apps', async () => {
+      const listed = jsonList(await fly(['apps', 'list', '-o', org, '--json'])).map((app) => app.Name ?? app.name);
+      existing = [names.images, names.backend, names.git, names.router, names.mx].filter((app) => listed.includes(app));
+      return existing.length ? `already in ${org}, and kept as they are: ${existing.join(', ')}` : `none of the five names is in ${org} yet`;
+    });
+  }
+
+  const disk = (gb) => cents(gb * PRICE.diskGb);
+  const creates = names ? [
+    { kind: 'app', name: names.images, what: 'your own image registry, holding the release', monthlyUsd: 0 },
+    { kind: 'app', name: names.backend, what: `the Workspace and its database: one ${SHAPES.backend.size} machine with ${SHAPES.backend.mb / 1024} GB of memory, always on`, monthlyUsd: machineMonthlyUsd(SHAPES.backend) },
+    { kind: 'app', name: names.git, what: 'the code host: one machine that sleeps when nobody uses it (the price is if it never slept)', monthlyUsd: machineMonthlyUsd(SHAPES.git) },
+    { kind: 'app', name: names.router, what: 'the router for previews and sites, always on', monthlyUsd: machineMonthlyUsd(SHAPES.router) },
+    { kind: 'app', name: names.mx, what: 'the mail receiver, always on', monthlyUsd: machineMonthlyUsd(SHAPES.mx) },
+    { kind: 'disk', name: `backend_data on ${names.backend}`, what: `${SHAPES.backend.diskGb} GB for the database, with daily snapshots`, monthlyUsd: disk(SHAPES.backend.diskGb) },
+    { kind: 'disk', name: `git_data on ${names.git}`, what: `${SHAPES.git.diskGb} GB for the code`, monthlyUsd: disk(SHAPES.git.diskGb) },
+    { kind: 'disk', name: `mx_data on ${names.mx}`, what: `${SHAPES.mx.diskGb} GB for the mail receiver's certificate`, monthlyUsd: disk(SHAPES.mx.diskGb) },
+    { kind: 'bucket', name: names.media, what: 'files people and agents attach', monthlyUsd: null },
+    { kind: 'bucket', name: names.backups, what: 'database backups', monthlyUsd: null },
+    { kind: 'address', name: `a dedicated IPv4 on ${names.mx}`, what: 'mail cannot run on a shared address', monthlyUsd: PRICE.ipv4 },
+    { kind: 'address', name: `shared IPv4 and IPv6 on ${names.backend}, ${names.git} and ${names.router}`, what: 'no charge', monthlyUsd: 0 },
+    { kind: 'certificate', name: domainOk ? `${domain}, git.${domain} and *.${domain}` : 'the domain, git. and *.', what: 'from Let\'s Encrypt, through Fly', monthlyUsd: 0 },
+    { kind: 'token', name: `${names.backend} (your own Agentic Cloud)`, what: 'an organization token the backend starts agent machines with', monthlyUsd: 0 },
+    { kind: 'secrets', name: `Fly secrets on ${names.backend}, ${names.git} and ${names.mx}`, what: 'keys made on this computer: an SSH key, the master key, shared secrets, the first-admin code', monthlyUsd: 0 },
+  ].map((item) => ({ ...item, exists: existing.includes(item.name) })) : [];
+  const monthlyUsd = cents(creates.reduce((sum, item) => sum + (item.exists ? 0 : item.monthlyUsd ?? 0), 0));
+  const unknown = '(given once the install has it)';
+  const records = names && domainOk
+    ? dnsRecords({ domain, names, backendV4: unknown, backendV6: unknown, mxV4: unknown, acmeTarget: '(given by Fly with the certificate)' }).map(publicRecord)
+    : [];
+
+  const problems = checks.filter((item) => !item.ok);
+  const forPerson = problems.filter((item) => item.who === 'person');
+  const forYou = problems.filter((item) => item.who === 'you');
+  const outcome = forYou.length ? 'failed' : forPerson.length ? 'needs-person' : 'ready';
+  const exitCode = forYou.length ? EXIT.failed : forPerson.length ? EXIT.person : EXIT.done;
+  const person = [
+    ...forPerson.map((item) => item.detail),
+    'Read what the install will create and what it costs, and say yes before it runs.',
+    `Add the DNS records the install prints${records.length ? ` (${records.length}${options['resend-key-file'] ? ', plus the mail provider\'s' : ''})` : ''} at the domain's DNS provider, unless whoever runs it can edit that DNS.`,
+    'At the end, keep the master key offline and open the first-admin link.',
+  ];
+
+  log(`Plan for your own Agentic Cloud${domainOk ? ` at ${domain}` : ''}${org ? `, in the Fly organization ${org}` : ''}. Nothing has been created or changed.\n`);
+  log('Checks:');
+  for (const item of checks) log(`  ${item.ok ? 'ok    ' : item.who === 'person' ? 'PERSON' : 'FIX   '}  ${item.key.padEnd(17)} ${item.detail}`);
+  if (creates.length) {
+    log(`\nIt would create${org ? ` in ${org}` : ''}:`);
+    for (const item of creates) log(`  ${usd(item.monthlyUsd).padStart(7)}  ${item.name}: ${item.what}${item.exists ? ' (already there)' : ''}`);
+    log(`\n  About $${monthlyUsd.toFixed(2)} a month at Fly's published prices before any agent, plus the buckets' storage by use.`);
+    log(`  Each agent machine: about $${PRICE.agentHour.toFixed(2)} an hour while it is awake, plus its disk. Fly's dashboard has the real bill.`);
+  }
+  if (records.length) log(`\nThe DNS records it will ask for:\n${formatRecords(records)}`);
+  if (state) log(`\nAn earlier run is recorded in ${stateFile}: ${INSTALL_STEPS.filter((key) => state.steps?.[key]).join(', ') || 'nothing'} done.`);
+  log(`\n${outcome === 'ready' ? 'Ready: run the same command without --plan.' : outcome === 'needs-person' ? 'A person is needed first (PERSON above).' : 'Fix the FIX lines above, then plan again.'}`);
+
+  const result = {
+    event: 'result', outcome, exitCode, command: 'plan', reason: forPerson[0]?.reason ?? null, domain: domainOk ? domain : null, org: org || null,
+    release: release?.version ?? null, checks, creates, monthlyUsd, agentHourlyUsd: PRICE.agentHour, records,
+    stepsDone: state ? INSTALL_STEPS.filter((key) => state.steps?.[key]) : [], person,
+  };
+  emit(result);
+  return result;
+}
+
+/** The state file a command was pointed at, or the one the installer left here. */
+function findStateFile(options) {
+  if (options.state) return path.resolve(options.state);
+  if (options.name) return path.resolve(`${String(options.name).toLowerCase()}-copy.json`);
+  if (options['key-file']) return path.resolve(`${readKeyFile(options['key-file']).customer}-copy.json`);
+  const here = readdirSync(process.cwd()).filter((file) => file.endsWith('-copy.json'));
+  if (here.length === 1) return path.resolve(here[0]);
+  throw new UsageError(here.length ? `Several installs are recorded here (${here.join(', ')}): say which with --state <file>.` : 'There is no <prefix>-copy.json here. Run this where the installer left it, or give --state <file>.');
+}
+
+/**
+ * Where an install stands, only looking: the steps done, every DNS record as
+ * the domain's own name servers answer it, each certificate as Fly reports
+ * it, the mail receiver's own certificate, mail out (with --resend-key-file)
+ * and, once installed, the Workspace's health. It creates, restarts and
+ * nudges nothing, so it can be run as often as anyone likes.
+ */
+export async function status(options, deps = {}) {
+  const log = deps.say ?? say;
+  const emit = eventSink(options, deps);
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  const stateFile = findStateFile(options);
+  if (!existsSync(stateFile)) throw new Error(`There is no ${stateFile}. Run this where the installer left it, or give --state <file>.`);
+  const state = JSON.parse(readFileSync(stateFile, 'utf8'));
+  const names = namesFor(state.prefix);
+  const domain = state.domain;
+  const stepsDone = INSTALL_STEPS.filter((key) => state.steps?.[key]);
+  const nextStep = INSTALL_STEPS.find((key) => !state.steps?.[key]) ?? null;
+  const base = { event: 'result', command: 'status', domain, stateFile, release: state.release?.version ?? null, stepsDone, nextStep };
+  log(`Your own Agentic Cloud at ${domain} (${stateFile}): ${stepsDone.length} of ${INSTALL_STEPS.length} install steps done${nextStep ? `, next: ${nextStep}` : ''}.`);
+
+  const finish = (outcome, exitCode, message, more = {}) => {
+    log(`\n${message}`);
+    const result = { ...base, outcome, exitCode, message, ...more };
+    emit(result);
+    return result;
+  };
+  if (state.upgrade) {
+    return finish('continue', EXIT.done, `An upgrade from ${state.upgrade.from?.version} to ${state.upgrade.toVersion} stopped part-way. Run the same upgrade command again: it carries on from where it stopped.`, { next: 'upgrade' });
+  }
+  if (!(state.acmeTarget && state.backendV4 && state.backendV6 && state.mxV4)) {
+    return finish('continue', EXIT.done, `Nothing for a person yet: the install has not asked for its DNS records. Run the same install command again: it carries on at "${nextStep}".`, { next: 'install' });
+  }
+
+  const records = dnsRecords({
+    domain, names, backendV4: state.backendV4, backendV6: state.backendV6, mxV4: state.mxV4, acmeTarget: state.acmeTarget, provider: state.sending?.records,
+  });
+  const { resolver } = await (deps.authoritativeResolver ?? authoritativeResolver)(domain);
+  const missing = [];
+  for (const record of records) {
+    const { ok, seen } = await checkRecord(resolver, record);
+    if (!ok) missing.push({ ...publicRecord(record), seen });
+  }
+  log(`  DNS: ${records.length - missing.length} of ${records.length} records right${missing.length ? `; missing:\n${formatRecords(missing)}` : ''}`);
+
+  const bin = deps.flyctl ?? findFlyctl();
+  if (!bin) throw new Error('flyctl is not installed. Install it (fly.io/docs/flyctl/install) and run this again.');
+  let token = deps.token ?? process.env.FLY_API_TOKEN ?? '';
+  const fly = deps.fly ?? ((args, opts) => flyRunner({ bin, token })(args, opts));
+  if (!token) token = (await fly(['auth', 'token'], { quiet: true }).catch(() => '')).trim();
+  if (!token) throw new PersonNeeded('fly-sign-in', NO_TOKEN);
+  const certificates = {};
+  for (const [app, host] of [[names.backend, domain], [names.git, `git.${domain}`], [names.router, `*.${domain}`]]) {
+    try {
+      certificates[host] = JSON.parse(await fly(['certs', 'show', host, '-a', app, '--json'])).status ?? 'unknown';
+    } catch (error) {
+      certificates[host] = `not readable (${error.message})`;
+    }
+  }
+  const certificatesWaiting = Object.entries(certificates).filter(([, value]) => value !== 'Ready').map(([host]) => host);
+  log(`  Certificates: ${certificatesWaiting.length ? `waiting for ${certificatesWaiting.join(', ')}` : 'all issued'}`);
+  let mailCertificate = false;
+  try {
+    mailCertificate = Boolean((await (await fetchImpl(`http://${state.mxV4}/health`, { signal: AbortSignal.timeout(5000) })).json()).starttls);
+  } catch { /* not up, or no answer */ }
+  log(`  Mail receiver's certificate: ${mailCertificate ? 'issued' : 'waiting'}`);
+  let mailOut = state.sending ? state.sending.provider : 'not set up';
+  if (state.sending?.provider === 'resend') {
+    const keyFile = options['resend-key-file'];
+    if (keyFile && keyFile !== true && existsSync(keyFile)) {
+      const provider = (deps.resendProvider ?? resendProvider)({ key: readFileSync(keyFile, 'utf8').trim(), fetchImpl });
+      mailOut = (await provider.status(state.sending.id).catch(() => 'unknown')) === 'verified' ? 'verified' : 'waiting';
+    } else {
+      mailOut = 'not checked (give --resend-key-file to check Resend)';
+    }
+  }
+  log(`  Mail out: ${mailOut}`);
+  const found = { records: missing, certificates, certificatesWaiting, mailCertificate, mailOut };
+
+  if (missing.length) {
+    return finish('needs-person', EXIT.person, `A person is needed: ${missing.length} of ${records.length} DNS records are not in place at ${domain}'s name servers. Add them exactly as above, all DNS only, then check again.`, { reason: 'dns', ...found });
+  }
+  if (certificatesWaiting.length || !mailCertificate || mailOut === 'waiting') {
+    const reason = certificatesWaiting.length ? 'certificates' : !mailCertificate ? 'mail-certificate' : 'mail-out';
+    return finish('waiting', EXIT.waiting, `Every DNS record is in. Nobody needs to do anything: ${state.steps?.smoke ? 'Fly and the mail receiver renew by themselves.' : 'run the same install command again (with --wait 20). While it waits it nudges Fly and the mail receiver to ask again, which this check never does.'}`, { reason, next: state.steps?.smoke ? null : 'install', ...found });
+  }
+  if (!state.steps?.smoke) {
+    return finish('continue', EXIT.done, 'Every DNS record and certificate is in. Run the same install command again to finish: the smoke test, then the first-admin link.', { next: 'install', ...found });
+  }
+  let healthy = false;
+  try {
+    healthy = (await (await fetchImpl(`https://${domain}/api/health`, { signal: AbortSignal.timeout(20_000) })).json()).status === 'ok';
+  } catch { /* below */ }
+  if (!healthy) return finish('unhealthy', EXIT.failed, `Installed, but https://${domain}/api/health does not say ok.`, found);
+  return finish('installed', EXIT.done, `Installed and healthy at https://${domain}, release ${state.release?.version}.`, found);
 }
 
 function flags(argv) {
@@ -1175,12 +1666,20 @@ async function main() {
   const [command, ...rest] = process.argv.slice(2);
   const options = flags(rest);
   if (command === 'install') {
-    if (!options.org || !options.domain || !options['key-file']) throw new Error('--org, --domain and --key-file are all needed.');
+    if (options.plan) {
+      process.exitCode = (await plan(options)).exitCode;
+      return;
+    }
+    if (!options.org || !options.domain || !options['key-file']) throw new UsageError('--org, --domain and --key-file are all needed.');
     await install(options);
     return;
   }
+  if (command === 'status') {
+    process.exitCode = (await status(options)).exitCode;
+    return;
+  }
   if (command === 'upgrade') {
-    if (!options['key-file']) throw new Error('--key-file is needed: the update key your own Agentic Cloud was installed with.');
+    if (!options['key-file']) throw new UsageError('--key-file is needed: the update key your own Agentic Cloud was installed with.');
     await upgrade(options);
     return;
   }
@@ -1189,13 +1688,17 @@ async function main() {
     say('         --licence-file <licence file> | --no-licence');
     say('         [--name <prefix>] [--region <code>] [--release <version>] [--wait <minutes>]');
     say('         [--resend-key-file <file> | --smtp-host <host> [--smtp-port <587|465>] [--smtp-user <user> --smtp-password-file <file>]]');
-    say('       node install.mjs upgrade --key-file <update key file> [--release <version|latest>] [--drill] [--state <file>]');
+    say('         [--plan] [--json]');
+    say('       node install.mjs status [--state <file>] [--resend-key-file <file>] [--json]');
+    say('       node install.mjs upgrade --key-file <update key file> [--release <version|latest>] [--drill] [--state <file>] [--json]');
     say('       node install.mjs copy --customer <id> --key-file <file> --to-app <images app> [--release <version|latest>]');
-    process.exit(2);
+    say('exit codes: 0 done, 1 failed, 2 wrong command, 3 a person is needed, 4 still waiting (run it again later)');
+    process.exitCode = EXIT.usage;
+    return;
   }
   const token = process.env.FLY_API_TOKEN;
-  if (!token) throw new Error('FLY_API_TOKEN is not set: a Fly token for the organization your own Agentic Cloud is in.');
-  if (!options.customer || !options['key-file'] || !options['to-app']) throw new Error('--customer, --key-file and --to-app are all needed.');
+  if (!token) throw new PersonNeeded('fly-sign-in', 'FLY_API_TOKEN is not set: a Fly token for the organization your own Agentic Cloud is in.');
+  if (!options.customer || !options['key-file'] || !options['to-app']) throw new UsageError('--customer, --key-file and --to-app are all needed.');
   const key = readFileSync(options['key-file'], 'utf8').trim();
   const source = updatesSource({ customer: options.customer, key, url: options.updates || UPDATES_URL });
   const dest = flyRegistry({ app: options['to-app'], token });
@@ -1206,5 +1709,12 @@ async function main() {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch((error) => { say(`install: ${error.message}`); process.exit(1); });
+  main().catch((error) => {
+    say(`install: ${error.message}`);
+    // With --json the last line is always the result, stopped or not.
+    if (process.argv.includes('--json')) jsonLine(resultOf(error));
+    // exitCode, not exit(): a pipe on macOS is written asynchronously, and
+    // exit() could cut off the line above.
+    process.exitCode = exitCodeOf(error);
+  });
 }

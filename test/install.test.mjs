@@ -6,7 +6,9 @@
  *   node --test test/
  */
 import { before, describe, it } from 'node:test';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
@@ -50,7 +52,7 @@ function fakeResolver(zone) {
 
 /** flyctl and Fly as the installer sees them: apps, buckets, secrets,
  *  addresses, deploys and certificates, each remembered. */
-function fakeFly({ failOnce } = {}) {
+function fakeFly({ failOnce, stuckCert } = {}) {
   const calls = [];
   const apps = new Set();
   const ips = new Map();
@@ -74,6 +76,7 @@ function fakeFly({ failOnce } = {}) {
     const flag = (name) => args[args.indexOf(name) + 1];
     if (failOnce && !failed && args.join(' ').includes(failOnce)) { failed = true; throw new Error(`fly ${a} ${b}: the network went away`); }
     if (a === 'apps' && b === 'list') return JSON.stringify([...apps].map((name) => ({ Name: name })));
+    if (a === 'orgs' && b === 'list') return JSON.stringify({ 'theirco-org': 'TheirCo', personal: 'Someone' });
     if (a === 'apps' && b === 'create') { apps.add(args[2]); return ''; }
     if (a === 'apps' && b === 'restart') { mxRestarts += 1; ready.add('mx'); return ''; }
     if (a === 'storage') {
@@ -113,7 +116,7 @@ function fakeFly({ failOnce } = {}) {
     if (a === 'volumes' && b === 'snapshots') { volumeSnapshots.push(args[3]); return ''; }
     if (a === 'certs' && b === 'list') return JSON.stringify([...(certs.get(flag('-a')) ?? [])].map((hostname) => ({ hostname })));
     if (a === 'certs' && b === 'add') { const app = flag('-a'); certs.set(app, new Set([...(certs.get(app) ?? []), args[2]])); return ''; }
-    if (a === 'certs' && b === 'check') { ready.add(args[2]); return ''; }
+    if (a === 'certs' && b === 'check') { if (args[2] !== stuckCert) ready.add(args[2]); return ''; }
     if (a === 'certs' && b === 'show') {
       return JSON.stringify({
         hostname: args[2], status: ready.has(args[2]) ? 'Ready' : 'Awaiting configuration',
@@ -125,13 +128,13 @@ function fakeFly({ failOnce } = {}) {
   return { fly, calls, apps, ips, secrets, deploys, ready, sql, volumeSnapshots, db: () => db, mxRestarts: () => mxRestarts, moveBackend: (ip) => { backendIp = ip; } };
 }
 
-function harness({ billing = 'CURRENT', failOnce } = {}) {
+function harness({ billing = 'CURRENT', failOnce, stuckCert, dnsNever = false } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), 'copy-install-'));
   const keyFile = path.join(dir, 'update.key');
   writeFileSync(keyFile, `${keyText({})}\n`);
   const licenceFile = path.join(dir, 'licence.txt');
   writeFileSync(licenceFile, `${LICENCE}\n`);
-  const flyFake = fakeFly({ failOnce });
+  const flyFake = fakeFly({ failOnce, stuckCert });
   const lines = [];
   let dnsAdded = false;
   const zone = () => {
@@ -164,7 +167,7 @@ function harness({ billing = 'CURRENT', failOnce } = {}) {
     settleMs: 0,
     say: (line) => {
       lines.push(line);
-      if (line.includes('Add these')) dnsAdded = true;
+      if (line.includes('Add these') && !dnsNever) dnsAdded = true;
     },
     updatesSource: () => ({ release: async () => ({ version: '2026.10.27.1', commit: 'abc123', images: {} }) }),
     flyRegistry: ({ app }) => ({ app }),
@@ -176,7 +179,9 @@ function harness({ billing = 'CURRENT', failOnce } = {}) {
     smokeTest: async () => [{ what: 'everything', ok: true, detail: 'fine' }],
   };
   const options = { org: 'theirco-org', domain: DOMAIN, 'key-file': keyFile, 'licence-file': licenceFile, state: path.join(dir, 'theirco-copy.json') };
-  return { dir, options, deps, fly: flyFake, lines, copied, stateText: () => readFileSync(options.state, 'utf8') };
+  return {
+    dir, options, deps, fly: flyFake, lines, copied, stateText: () => readFileSync(options.state, 'utf8'), addDns: () => { dnsAdded = true; },
+  };
 }
 
 describe('the installer: one command, an organization and a domain', () => {
@@ -480,5 +485,223 @@ describe('the installer\'s parts', () => {
     expect(installer.bucketKeys('ready\nAWS_ENDPOINT_URL_S3: https://fly.storage.tigris.dev\nAWS_REGION: auto\nBUCKET_NAME: b\nAWS_ACCESS_KEY_ID: tid_1\nAWS_SECRET_ACCESS_KEY: tsec_2\n'))
       .toEqual({ bucket: 'b', endpoint: 'https://fly.storage.tigris.dev', region: 'auto', accessKeyId: 'tid_1', secretAccessKey: 'tsec_2' });
     expect(() => installer.bucketKeys('Error: something')).toThrow('did not print');
+  });
+});
+
+/** flyctl's verbs that only read. Everything else changes something. */
+const READS = new Set(['apps list', 'orgs list', 'auth token', 'certs show']);
+const writes = (calls) => calls.map((args) => args.slice(0, 2).join(' ')).filter((verb) => !READS.has(verb));
+const stopped = (promise) => promise.then(() => { throw new Error('expected it to stop'); }, (error) => error);
+
+describe('driven by an agent: a plan, JSON, and when a person is needed', () => {
+  it('plans without changing anything, and says what it would create and what it costs', async () => {
+    const h = harness();
+    const events = [];
+    const result = await installer.plan({ ...h.options, json: true }, { ...h.deps, emit: (event) => events.push(event) });
+    expect(result.outcome).toBe('ready');
+    expect(result.exitCode).toBe(0);
+    expect(result.checks.filter((check) => !check.ok)).toEqual([]);
+    // Nothing made, nothing written: no state, no log, no Fly call that changes anything.
+    expect(writes(h.fly.calls)).toEqual([]);
+    expect(readdirSync(h.dir).sort()).toEqual(['licence.txt', 'update.key']);
+    expect(h.copied).toEqual([]);
+
+    expect(result.creates.filter((item) => item.kind === 'app').map((item) => item.name))
+      .toEqual(['theirco-images', 'theirco-backend', 'theirco-git', 'theirco-router', 'theirco-mx']);
+    expect(result.creates.find((item) => item.name === 'a dedicated IPv4 on theirco-mx').monthlyUsd).toBe(2);
+    expect(result.creates.find((item) => item.name === 'theirco-backend').monthlyUsd).toBe(11.38);
+    expect(result.monthlyUsd).toBe(21.5);
+    expect(result.records.find((record) => record.name === `*.${DOMAIN}`).value).toBe('theirco-router.fly.dev');
+    expect(result.records).toHaveLength(8);
+    expect(result.release).toBe('2026.10.27.1');
+    // The result is the last event, and no key rides in it.
+    expect(events.at(-1)).toEqual(result);
+    const said = JSON.stringify(events);
+    expect(said).not.toContain(readFileSync(h.options['key-file'], 'utf8').trim());
+    expect(said).not.toContain(LICENCE);
+    expect(h.lines.join('\n')).toContain('Nothing has been created or changed');
+  });
+
+  it('plans with the same machine shapes the install deploys', async () => {
+    const h = harness();
+    await installer.install(h.options, h.deps);
+    const backend = h.fly.deploys.find((deploy) => deploy.app === 'theirco-backend').toml;
+    expect(backend).toContain(`size = "${installer.SHAPES.backend.size}"`);
+    expect(backend).toContain(`memory = "${installer.SHAPES.backend.memory}"`);
+    expect(backend).toContain(`initial_size = "${installer.SHAPES.backend.diskGb}gb"`);
+  });
+
+  it('names what only a person can do, and still changes nothing', async () => {
+    const h = harness({ billing: 'PAST_DUE' });
+    const { 'licence-file': _licence, ...without } = h.options;
+    const result = await installer.plan(without, h.deps);
+    expect(result.outcome).toBe('needs-person');
+    expect(result.exitCode).toBe(3);
+    expect(result.reason).toBe('licence');
+    expect(result.checks.filter((check) => !check.ok).map((check) => `${check.who} ${check.reason}`)).toEqual(['person licence', 'person billing']);
+    expect(result.checks.find((check) => check.reason === 'billing').billingUrl).toBe('https://fly.io/dashboard/theirco-org/billing');
+    expect(result.person[0]).toContain('needs its licence');
+    expect(writes(h.fly.calls)).toEqual([]);
+  });
+
+  it('without --org, lists the organizations the sign-in reaches for the person to choose', async () => {
+    const h = harness();
+    const { org: _org, ...noOrg } = h.options;
+    const result = await installer.plan(noOrg, h.deps);
+    const org = result.checks.find((check) => check.key === 'fly-organization');
+    expect(org.reason).toBe('fly-organization');
+    expect(org.organizations).toEqual(['theirco-org', 'personal']);
+    expect(result.exitCode).toBe(3);
+  });
+
+  it('with --json, reports each step and the result, keeps every key off the screen, and leaves the two secrets in a handover file', async () => {
+    const h = harness();
+    const events = [];
+    await installer.install({ ...h.options, json: true }, { ...h.deps, emit: (event) => events.push(event) });
+    expect(events.filter((event) => event.event === 'step' && event.status === 'done').map((event) => event.key)).toEqual(['checks', ...installer.INSTALL_STEPS]);
+    expect(events.find((event) => event.event === 'dns-records').records).toHaveLength(8);
+    const result = events.at(-1);
+    expect(result.outcome).toBe('done');
+    expect(result.exitCode).toBe(0);
+    expect(result.signInUrl).toBe(`https://${DOMAIN}`);
+    expect(result.handoverFile).toBe(path.join(h.dir, 'theirco-handover.txt'));
+
+    const stored = h.fly.secrets['theirco-backend'][0].values;
+    const keys = ['FLY_API_TOKEN', 'FLY_SSH_PRIVATE_KEY', 'SECRETS_MASTER_KEY', 'GIT_HOST_SECRET', 'CI_STATUS_SECRET', 'MAIL_INGEST_SECRET', 'FIRST_ACCOUNT_CODE', 'MEDIA_S3_SECRET_ACCESS_KEY', 'BACKUP_S3_SECRET_ACCESS_KEY', 'LICENCE'];
+    const said = `${JSON.stringify(events)}\n${h.lines.join('\n')}\n${h.stateText()}`;
+    for (const name of keys) expect(said, `${name} was shown`).not.toContain(stored[name]);
+
+    const handover = readFileSync(result.handoverFile, 'utf8');
+    expect(handover).toContain(`https://${DOMAIN}/signup#first-account=${stored.FIRST_ACCOUNT_CODE}`);
+    expect(handover).toContain(stored.SECRETS_MASTER_KEY);
+    expect(statSync(result.handoverFile).mode & 0o777).toBe(0o600);
+  });
+
+  it('stops for a person when the DNS records are not in, with exactly the records to add (exit 3), and carries on once they are', async () => {
+    const h = harness({ dnsNever: true });
+    const error = await stopped(installer.install({ ...h.options, wait: '0' }, h.deps));
+    expect(error instanceof installer.PersonNeeded).toBe(true);
+    expect(installer.exitCodeOf(error)).toBe(3);
+    const result = installer.resultOf(error);
+    expect(result.outcome).toBe('needs-person');
+    expect(result.reason).toBe('dns');
+    expect(result.records).toHaveLength(8);
+    expect(result.records.find((record) => record.name === `git.${DOMAIN}`)).toEqual({ name: `git.${DOMAIN}`, type: 'CNAME', value: 'theirco-git.fly.dev', why: 'the code host' });
+    expect(result.records.find((record) => record.type === 'MX')).toEqual({ name: DOMAIN, type: 'MX', value: `mx.${DOMAIN}`, priority: 10, why: 'mail in' });
+    expect(JSON.parse(h.stateText()).steps.dns).toBeUndefined();
+
+    h.addDns();
+    const state = await installer.install(h.options, h.deps);
+    expect(state.steps.smoke).toBeDefined();
+  });
+
+  it('says it is still waiting, not failing, when only a certificate is slow (exit 4)', async () => {
+    const h = harness({ stuckCert: `git.${DOMAIN}` });
+    const error = await stopped(installer.install({ ...h.options, wait: '0' }, h.deps));
+    expect(error instanceof installer.StillWaiting).toBe(true);
+    expect(installer.exitCodeOf(error)).toBe(4);
+    const result = installer.resultOf(error);
+    expect(result.outcome).toBe('waiting');
+    expect(result.reason).toBe('certificates');
+    expect(result.certificatesWaiting).toContain(`git.${DOMAIN}`);
+    expect(result.missing).toEqual([]);
+  });
+
+  it('asks a person for the update key it cannot find, before anything is made', async () => {
+    const h = harness();
+    const error = await stopped(installer.install({ ...h.options, 'key-file': path.join(h.dir, 'missing.key') }, h.deps));
+    expect(installer.resultOf(error)).toEqual({
+      event: 'result', outcome: 'needs-person', exitCode: 3, reason: 'update-key',
+      message: `There is no update key at ${path.join(h.dir, 'missing.key')}. It comes from us with the agreement, one line in a file.`,
+    });
+    expect(h.fly.calls).toEqual([]);
+  });
+
+  it('ends an upgrade with a JSON result too', async () => {
+    const h = await installed();
+    const events = [];
+    await installer.upgrade({ ...h.options, json: true }, { ...h.deps, emit: (event) => events.push(event) });
+    expect(events.at(-1)).toEqual({ event: 'result', outcome: 'done', exitCode: 0, command: 'upgrade', domain: DOMAIN, release: '2026.10.28.1', previous: '2026.10.27.1' });
+  });
+});
+
+describe('status: it only looks', () => {
+  it('says a person is needed while records are missing, waiting while certificates are, and installed at the end', async () => {
+    const h = harness({ dnsNever: true });
+    await stopped(installer.install({ ...h.options, wait: '0' }, h.deps));
+    const look = async () => {
+      const before = h.fly.calls.length;
+      const kept = h.stateText();
+      const result = await installer.status({ state: h.options.state, json: true }, h.deps);
+      // Read only: no flyctl verb that changes anything, no nudge, and the record untouched.
+      expect(writes(h.fly.calls.slice(before))).toEqual([]);
+      expect(h.stateText()).toBe(kept);
+      return result;
+    };
+
+    const missing = await look();
+    expect(missing.outcome).toBe('needs-person');
+    expect(missing.exitCode).toBe(3);
+    expect(missing.reason).toBe('dns');
+    expect(missing.records).toHaveLength(8);
+
+    h.addDns();
+    const waiting = await look();
+    expect(waiting.outcome).toBe('waiting');
+    expect(waiting.exitCode).toBe(4);
+    expect(waiting.reason).toBe('certificates');
+    expect(waiting.next).toBe('install');
+
+    await installer.install(h.options, h.deps);
+    const done = await look();
+    expect(done.outcome).toBe('installed');
+    expect(done.exitCode).toBe(0);
+    expect(done.release).toBe('2026.10.27.1');
+  });
+});
+
+describe('the command line', () => {
+  /** The real command, as an agent runs it, with only a local stand-in for the update service. */
+  const run = (args, env = {}) => new Promise((resolve) => {
+    const child = spawn(process.execPath, [INSTALLER, ...args], { env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (chunk) => { out += chunk; });
+    child.stderr.on('data', (chunk) => { err += chunk; });
+    child.on('close', (code) => resolve({ code, out, err }));
+  });
+
+  it('--plan --json prints JSON lines only, ends on the result, and exits 3 when a person must sign in to Fly', async () => {
+    const h = harness();
+    const server = createServer((req, res) => {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ version: '2026.10.27.1', commit: 'abc123', images: {} }));
+    });
+    await new Promise((resolve) => { server.listen(0, '127.0.0.1', resolve); });
+    // A flyctl that is installed and signed in to nothing.
+    const flyctl = path.join(h.dir, 'fly');
+    writeFileSync(flyctl, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    try {
+      const { code, out } = await run([
+        'install', '--org', 'theirco-org', '--domain', DOMAIN, '--key-file', h.options['key-file'], '--licence-file', h.options['licence-file'],
+        '--state', h.options.state, '--updates', `http://127.0.0.1:${server.address().port}`, '--plan', '--json',
+      ], { FLYCTL: flyctl, FLY_API_TOKEN: '' });
+      const lines = out.trim().split('\n').map((line) => JSON.parse(line));
+      expect(code).toBe(3);
+      expect(lines.at(-1).event).toBe('result');
+      expect(lines.at(-1).outcome).toBe('needs-person');
+      expect(lines.at(-1).reason).toBe('fly-sign-in');
+      expect(lines.at(-1).release).toBe('2026.10.27.1');
+      expect(out).not.toContain(readFileSync(h.options['key-file'], 'utf8').trim());
+      expect(existsSync(h.options.state)).toBe(false);
+    } finally {
+      server.close();
+    }
+  });
+
+  it('ends on a JSON result when it fails, too', async () => {
+    const { code, out } = await run(['status', '--state', path.join(tmpdir(), 'nothing-here-copy.json'), '--json']);
+    expect(code).toBe(1);
+    expect(JSON.parse(out.trim().split('\n').at(-1)).outcome).toBe('failed');
   });
 });
