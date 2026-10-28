@@ -258,7 +258,7 @@ export function backendEnv({ names, org, region, domain, tags, peerIp, version, 
 /** The four apps' Fly configurations for one copy and one release. */
 export function appConfigs({ names, org, region, domain, tags, peerIp, version, extraEnv = {} }) {
   const head = (app, what) => [
-    `# ${what}: private copy ${domain}, release ${version}. Written by install.mjs;`,
+    `# ${what}: your own Agentic Cloud at ${domain}, release ${version}. Written by install.mjs;`,
     '# the installer and the upgrade command write it again, so change it there.',
     `app = ${q(app)}`,
     `primary_region = ${q(region)}`,
@@ -493,7 +493,7 @@ export async function checkOrganization(token, org, fetchImpl = fetch) {
   }
   const found = data?.organization;
   if (!found) throw new Error(`There is no Fly organization ${org} for this token.`);
-  if (!found.billable) throw new Error(`The organization ${org} has no card on file. A copy needs one (its mail address is a dedicated IPv4). Add it at fly.io/dashboard/${org}/billing and run this again.`);
+  if (!found.billable) throw new Error(`The organization ${org} has no card on file. Your own Agentic Cloud needs one (its mail address is a dedicated IPv4). Add it at fly.io/dashboard/${org}/billing and run this again.`);
   if (found.billingStatus !== 'CURRENT') {
     throw new Error(`Fly says the organization ${org}'s bill is not paid (${String(found.billingStatus).toLowerCase().replace('_', ' ')}), and it refuses to create anything until it is. Settle it at fly.io/dashboard/${org}/billing and run this again.`);
   }
@@ -594,10 +594,10 @@ export async function smokeTest({ domain, mxV4, fetchImpl = fetch, smtpBanner = 
     if (health.status !== 'ok') throw new Error(`health says ${JSON.stringify(health)}`);
     return 'healthy';
   });
-  await probe('the sign-up page is the copy\'s own', async () => {
+  await probe('the sign-up page is its own', async () => {
     const answer = await fetchImpl(`https://${domain}/signup`, { signal: AbortSignal.timeout(20_000) });
     const page = await answer.text();
-    if (!page.includes('<meta name="acc-private-copy" content="1">')) throw new Error('the page does not say it is a private copy');
+    if (!page.includes('<meta name="acc-private-copy" content="1">')) throw new Error('the page does not say it is your own Agentic Cloud');
     if (!page.includes(`<meta name="acc-public-host" content="${domain}">`)) throw new Error(`the page does not name ${domain}`);
     return 'invite-only, on its own name';
   });
@@ -657,8 +657,8 @@ export async function install(options, deps = {}) {
   const updateKey = readUpdateKey(readFileSync(options['key-file'], 'utf8'));
   const domain = String(options.domain ?? '').toLowerCase().replace(/\.$/, '');
   const org = String(options.org ?? '');
-  if (!org) throw new Error('--org is the Fly organization the copy goes into (its slug, as `fly orgs list` shows).');
-  if (!DOMAIN_SHAPE.test(domain)) throw new Error('--domain is the name the copy owns, like agents.theirco.com.');
+  if (!org) throw new Error('--org is the Fly organization your own Agentic Cloud goes into (its slug, as `fly orgs list` shows).');
+  if (!DOMAIN_SHAPE.test(domain)) throw new Error('--domain is the name your own Agentic Cloud lives on, like agents.theirco.com.');
   if (updateKey.domain !== domain) throw new Error(`This update key was issued for ${updateKey.domain}, not ${domain}. Ask us for a key for ${domain}, or use that domain.`);
   const smtpHost = options['smtp-host'] ? String(options['smtp-host']).trim() : '';
   if (smtpHost && options['resend-key-file']) throw new Error('Mail out goes one way: --resend-key-file or --smtp-host, not both.');
@@ -673,16 +673,16 @@ export async function install(options, deps = {}) {
     if (payload?.kind !== 'licence') throw new Error('That file does not hold a licence. Ask us for the licence file.');
     if (payload.domain !== domain) throw new Error(`This licence was issued for ${payload.domain}, not ${domain}.`);
   } else if (!options['no-licence'] && !existsSync(path.resolve(options.state ?? `${String(options.name ?? updateKey.customer).toLowerCase()}-copy.json`))) {
-    throw new Error('A copy needs its licence: --licence-file <file>. Run with --no-licence only if your contract says the copy has none.');
+    throw new Error('Your own Agentic Cloud needs its licence: --licence-file <file>. Run with --no-licence only if your contract says it has none.');
   }
   const prefix = String(options.name ?? updateKey.customer).toLowerCase();
-  if (!PREFIX_SHAPE.test(prefix)) throw new Error('--name is a short lowercase prefix for the copy\'s app names, like theirco.');
+  if (!PREFIX_SHAPE.test(prefix)) throw new Error('--name is a short lowercase prefix for its app names, like theirco.');
   const names = namesFor(prefix);
 
   const stateFile = path.resolve(options.state ?? `${prefix}-copy.json`);
   const logFile = path.resolve(`${prefix}-install.log`);
   const state = existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, 'utf8')) : { steps: {} };
-  if (state.domain && state.domain !== domain) throw new Error(`${stateFile} is the record of ${state.domain}'s copy, not ${domain}'s.`);
+  if (state.domain && state.domain !== domain) throw new Error(`${stateFile} is the record of ${state.domain}, not ${domain}.`);
   const save = () => writeFileSync(stateFile, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   Object.assign(state, { prefix, org, domain, customer: updateKey.customer });
   if (options['no-licence']) state.extraEnv = { ...state.extraEnv, backend: { ...state.extraEnv?.backend, COPY_LICENCE: 'off' } };
@@ -714,7 +714,7 @@ export async function install(options, deps = {}) {
   };
   const ips = async (app) => jsonList(await fly(['ips', 'list', '-a', app, '--json']));
 
-  log(`Private copy for ${domain} in the Fly organization ${org} (apps ${prefix}-*).`);
+  log(`Your own Agentic Cloud for ${domain}, in the Fly organization ${org} (apps ${prefix}-*).`);
   log(`State: ${stateFile}   Log: ${logFile}`);
 
   // 1. Before anything is made: the organization can pay, the key opens a release.
@@ -760,7 +760,7 @@ export async function install(options, deps = {}) {
     const ssh = sshKeyPair(`${names.backend}@${domain}`);
     let backendToken = null;
     try {
-      const minted = (await fly(['tokens', 'create', 'org', '-o', org, '-n', `${names.backend} (private copy)`, '-x', '87600h'], { quiet: true })).trim();
+      const minted = (await fly(['tokens', 'create', 'org', '-o', org, '-n', `${names.backend} (your own Agentic Cloud)`, '-x', '87600h'], { quiet: true })).trim();
       backendToken = minted.split('\n').find((line) => line.startsWith('FlyV1 ')) ?? null;
     } catch { /* an organization token cannot make another: the backend keeps this one */ }
     if (!backendToken) log('        The backend keeps the organization token this install runs with (it cannot make a second one).');
@@ -817,7 +817,7 @@ export async function install(options, deps = {}) {
 
   const deployApp = (which, peerIp) => deployOne({ fly, state, names, which, release: state.release, peerIp });
 
-  await step('deploy', 'Starting the four apps from the copy\'s own registry', async () => {
+  await step('deploy', 'Starting the four apps from your own registry', async () => {
     for (const which of ['backend', 'git', 'router', 'mx']) {
       const at = Date.now();
       await deployApp(which);
@@ -939,17 +939,17 @@ export async function install(options, deps = {}) {
   });
 
   const shown = state.pending ?? {};
-  log(`\nYour private copy is ready. This run took ${minutes(Date.now() - started)}.`);
+  log(`\nYour own Agentic Cloud is ready. This run took ${minutes(Date.now() - started)}.`);
   log(`\n  Sign-in address:  https://${domain}`);
   if (shown.FIRST_ACCOUNT_CODE) {
     log(`  First admin:      https://${domain}/signup#first-account=${shown.FIRST_ACCOUNT_CODE}`);
     log('                    The first person to open it and sign up becomes the admin. It works once,');
-    log('                    and only while the copy has no account; everyone else joins by invite.');
+    log('                    and only while there is no account yet; everyone else joins by invite.');
   }
   if (shown.SECRETS_MASTER_KEY) {
     log(`  Master key:       ${shown.SECRETS_MASTER_KEY}`);
     log('                    Keep it offline, now: this is the only time it is shown. Without it a database');
-    log('                    restored into a new copy cannot open the keys people saved in it.');
+    log('                    restored into a new install cannot open the keys people saved in it.');
   }
   if (!state.sending) log(`  Mail out:         not set up. Run again with --resend-key-file <file> or --smtp-host <host> to send as ${domain}.`);
   log(`  Kept here:        ${stateFile} (names and addresses, no keys); the upgrade command reads it.`);
@@ -1180,7 +1180,7 @@ async function main() {
     return;
   }
   if (command === 'upgrade') {
-    if (!options['key-file']) throw new Error('--key-file is needed: the update key the copy was installed with.');
+    if (!options['key-file']) throw new Error('--key-file is needed: the update key your own Agentic Cloud was installed with.');
     await upgrade(options);
     return;
   }
@@ -1194,7 +1194,7 @@ async function main() {
     process.exit(2);
   }
   const token = process.env.FLY_API_TOKEN;
-  if (!token) throw new Error('FLY_API_TOKEN is not set: a Fly token for the copy\'s organization.');
+  if (!token) throw new Error('FLY_API_TOKEN is not set: a Fly token for the organization your own Agentic Cloud is in.');
   if (!options.customer || !options['key-file'] || !options['to-app']) throw new Error('--customer, --key-file and --to-app are all needed.');
   const key = readFileSync(options['key-file'], 'utf8').trim();
   const source = updatesSource({ customer: options.customer, key, url: options.updates || UPDATES_URL });

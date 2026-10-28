@@ -180,7 +180,7 @@ function harness({ billing = 'CURRENT', failOnce } = {}) {
 }
 
 describe('the installer: one command, an organization and a domain', () => {
-  it('builds a whole copy in order, from the copy\'s own registry', async () => {
+  it('builds the whole of it in order, from its own registry', async () => {
     const h = harness();
     const state = await installer.install(h.options, h.deps);
     const verbs = h.fly.calls.map((args) => args.slice(0, 2).join(' '));
@@ -353,7 +353,7 @@ describe('upgrades with a way back', () => {
     expect(JSON.parse(h.stateText()).release.version).toBe('2026.10.27.1');
   });
 
-  it('says so and does nothing when the copy already runs the release', async () => {
+  it('says so and does nothing when it already runs the release', async () => {
     const h = await installed();
     const before = h.fly.calls.length;
     await installer.upgrade(h.options, { ...h.deps, updatesSource: () => ({ release: async () => ({ version: '2026.10.27.1', images: {} }) }) });
@@ -382,7 +382,7 @@ describe('the installer and the licence', () => {
   it('will not install without a licence, or with one for another domain', async () => {
     const h = harness();
     const { 'licence-file': _licence, ...without } = h.options;
-    await expect(installer.install(without, h.deps)).rejects.toThrow('A copy needs its licence: --licence-file <file>');
+    await expect(installer.install(without, h.deps)).rejects.toThrow('Your own Agentic Cloud needs its licence: --licence-file <file>');
     writeFileSync(h.options['licence-file'], LICENCE.replace(/^acc1\.[^.]+/, `acc1.${Buffer.from(JSON.stringify({ kind: 'licence', domain: 'agents.other.test' })).toString('base64url')}`));
     await expect(installer.install(h.options, h.deps)).rejects.toThrow('This licence was issued for agents.other.test');
     expect(h.fly.calls).toEqual([]);
