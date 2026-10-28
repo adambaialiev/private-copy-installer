@@ -1,6 +1,6 @@
-# Private copy installer
+# Installer for your own Agentic Cloud
 
-This is the command that installs a **private copy** of Agentic Cloud Computer in your own [Fly.io](https://fly.io) organization, on a domain of yours, and later upgrades it. It is published so that your engineer can read exactly what it creates, what it sends and where it sends it, before running it with full rights over your Fly organization.
+This is the command that installs **your own Agentic Cloud**, the whole of Agentic Cloud Computer, in your own [Fly.io](https://fly.io) organization and on a domain of yours, and later upgrades it. It is published so that your engineer can read exactly what it creates, what it sends and where it sends it, before running it with full rights over your Fly organization.
 
 The whole installer is one file, [`install.mjs`](install.mjs). It needs Node and nothing else: no packages, and nothing is downloaded or run besides the release images described below.
 
@@ -37,8 +37,8 @@ With `--json`, every line on stdout is one JSON object, and the last line is alw
 
 - **Node 20 or newer** and **[flyctl](https://fly.io/docs/flyctl/install/)**, signed in or with `FLY_API_TOKEN` set to a token for the organization.
 - **A Fly organization** with billing in order. The installer checks this before it creates anything.
-- **A domain for the copy**, such as `agents.yourcompany.com`, where you can add DNS records. Use a name of its own, not your company's main domain: the Workspace, mail, code, previews and sites all live on it.
-- **An update key and a licence** from us, each one line in a file. The update key lets the installer download our releases. The licence says how many people the copy is for and until when, and the copy checks it itself without calling us. If your contract has no licence, run with `--no-licence`.
+- **A domain for your own Agentic Cloud**, such as `agents.yourcompany.com`, where you can add DNS records. Use a name of its own, not your company's main domain: the Workspace, mail, code, previews and sites all live on it.
+- **An update key and a licence** from us, each one line in a file. The update key lets the installer download our releases. The licence says how many people it is for and until when, and your own Agentic Cloud checks it itself without calling us. If your contract has no licence, run with `--no-licence`.
 - **A way to send mail** (optional; it can be added later). Either a [Resend](https://resend.com) API key, or any provider over standard SMTP.
 
 ## Install
@@ -64,7 +64,7 @@ At the end it prints:
 
 - the sign-in address;
 - a **one-time link that makes the first admin**;
-- the copy's **master key**. This is shown once. Keep it offline: without it, a database restored into a new copy cannot open the keys people saved in it.
+- its **master key**. This is shown once. Keep it offline: without it, a database restored into a new install cannot open the keys people saved in it.
 
 ## Check where it stands
 
@@ -111,12 +111,12 @@ It prints about twelve DNS records for you to add and checks them with your doma
 ## Where it connects, and what it sends
 
 - **Fly** (flyctl, and `api.fly.io` to read your organization's billing state): to create and deploy everything above, in your organization, with your token.
-- **Our update service** (`https://acc-updates.fly.dev`): signed in as your customer id and update key, only to download a release's list of images and the images themselves. It sends nothing about your copy. Your copy runs only from your own registry and never pulls from us.
+- **Our update service** (`https://acc-updates.fly.dev`): signed in as your customer id and update key, only to download a release's list of images and the images themselves. It sends nothing about your own Agentic Cloud, which runs only from your own registry and never pulls from us.
 - **Your domain's name servers**: to check the records you added.
 - **Resend's API** (only with `--resend-key-file`): to register your domain for sending and read the records it needs.
-- **Your copy itself**: the smoke test reads the health pages of the Workspace, the code host, the router and the mail receiver, the sign-up page, and the mail receiver's greeting on port 25.
+- **Your own Agentic Cloud itself**: the smoke test reads the health pages of the Workspace, the code host, the router and the mail receiver, the sign-up page, and the mail receiver's greeting on port 25.
 
-There is no telemetry. Once installed, the copy makes no call to us; its licence check is done offline.
+There is no telemetry. Once installed, your own Agentic Cloud makes no call to us; its licence check is done offline.
 
 ## Tests
 
