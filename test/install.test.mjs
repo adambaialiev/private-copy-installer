@@ -120,7 +120,8 @@ function fakeFly({ failOnce, stuckCert } = {}) {
     if (a === 'certs' && b === 'show') {
       return JSON.stringify({
         hostname: args[2], status: ready.has(args[2]) ? 'Ready' : 'Awaiting configuration',
-        dns_requirements: { acme_challenge: { name: `_acme-challenge.${DOMAIN}`, target: `${DOMAIN}.x1y2z3.flydns.net.` } },
+        // Fly names a DNS-validation target for every certificate, the wildcard's and the others'.
+        dns_requirements: { acme_challenge: { name: `_acme-challenge.${args[2].replace(/^\*\./, '')}`, target: `${args[2].replace(/^\*\./, '')}.x1y2z3.flydns.net.` } },
       });
     }
     throw new Error(`unexpected fly ${args.join(' ')}`);
@@ -147,6 +148,7 @@ function harness({ billing = 'CURRENT', failOnce, stuckCert, dnsNever = false } 
       backendV6: ipsOf('theirco-backend').find((ip) => ip.Type === 'v6').Address,
       mxV4: ipsOf('theirco-mx').find((ip) => ip.Type === 'v4').Address,
       acmeTarget: `${DOMAIN}.x1y2z3.flydns.net`,
+      gitAcmeTarget: `git.${DOMAIN}.x1y2z3.flydns.net`,
     });
   };
   const fetchImpl = async (url) => {
@@ -512,7 +514,7 @@ describe('driven by an agent: a plan, JSON, and when a person is needed', () => 
     expect(result.creates.find((item) => item.name === 'theirco-backend').monthlyUsd).toBe(11.38);
     expect(result.monthlyUsd).toBe(21.5);
     expect(result.records.find((record) => record.name === `*.${DOMAIN}`).value).toBe('theirco-router.fly.dev');
-    expect(result.records).toHaveLength(8);
+    expect(result.records).toHaveLength(9);
     expect(result.release).toBe('2026.10.27.1');
     // The result is the last event, and no key rides in it.
     expect(events.at(-1)).toEqual(result);
@@ -559,7 +561,7 @@ describe('driven by an agent: a plan, JSON, and when a person is needed', () => 
     const events = [];
     await installer.install({ ...h.options, json: true }, { ...h.deps, emit: (event) => events.push(event) });
     expect(events.filter((event) => event.event === 'step' && event.status === 'done').map((event) => event.key)).toEqual(['checks', ...installer.INSTALL_STEPS]);
-    expect(events.find((event) => event.event === 'dns-records').records).toHaveLength(8);
+    expect(events.find((event) => event.event === 'dns-records').records).toHaveLength(9);
     const result = events.at(-1);
     expect(result.outcome).toBe('done');
     expect(result.exitCode).toBe(0);
@@ -585,7 +587,7 @@ describe('driven by an agent: a plan, JSON, and when a person is needed', () => 
     const result = installer.resultOf(error);
     expect(result.outcome).toBe('needs-person');
     expect(result.reason).toBe('dns');
-    expect(result.records).toHaveLength(8);
+    expect(result.records).toHaveLength(9);
     expect(result.records.find((record) => record.name === `git.${DOMAIN}`)).toEqual({ name: `git.${DOMAIN}`, type: 'CNAME', value: 'theirco-git.fly.dev', why: 'the code host' });
     expect(result.records.find((record) => record.type === 'MX')).toEqual({ name: DOMAIN, type: 'MX', value: `mx.${DOMAIN}`, priority: 10, why: 'mail in' });
     expect(JSON.parse(h.stateText()).steps.dns).toBeUndefined();
@@ -593,6 +595,26 @@ describe('driven by an agent: a plan, JSON, and when a person is needed', () => 
     h.addDns();
     const state = await installer.install(h.options, h.deps);
     expect(state.steps.smoke).toBeDefined();
+  });
+
+  it('asks up front for the code host certificate\'s DNS-validation record, as Fly names it, and checks it like the rest', async () => {
+    const want = { name: `_acme-challenge.git.${DOMAIN}`, type: 'CNAME', value: `git.${DOMAIN}.x1y2z3.flydns.net`, why: 'the certificate for the code host, proved by DNS' };
+    const planned = await installer.plan(harness().options, harness().deps);
+    expect(planned.records.find((record) => record.name === want.name).value).toBe('(given by Fly with the certificate)');
+
+    const h = harness({ dnsNever: true });
+    const error = await stopped(installer.install({ ...h.options, wait: '0' }, h.deps));
+    expect(error.details.records.find((record) => record.name === want.name)).toEqual(want);
+    expect(h.lines.join('\n')).toContain(`_acme-challenge.git.${DOMAIN}`);
+    expect(JSON.parse(h.stateText()).gitAcmeTarget).toBe(want.value);
+
+    // An install begun before the installer asked for it reads it from Fly when it carries on.
+    const older = JSON.parse(h.stateText());
+    delete older.gitAcmeTarget;
+    writeFileSync(h.options.state, JSON.stringify(older));
+    const resumed = await stopped(installer.install({ ...h.options, wait: '0' }, h.deps));
+    expect(resumed.details.records.map((record) => record.name)).toContain(want.name);
+    expect(h.fly.calls.filter((args) => args.join(' ') === `certs show git.${DOMAIN} -a theirco-git --json`).length).toBeGreaterThanOrEqual(2);
   });
 
   it('says it is still waiting, not failing, when only a certificate is slow (exit 4)', async () => {
@@ -643,7 +665,7 @@ describe('status: it only looks', () => {
     expect(missing.outcome).toBe('needs-person');
     expect(missing.exitCode).toBe(3);
     expect(missing.reason).toBe('dns');
-    expect(missing.records).toHaveLength(8);
+    expect(missing.records).toHaveLength(9);
 
     h.addDns();
     const waiting = await look();

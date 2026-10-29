@@ -504,7 +504,7 @@ export function appConfigs({ names, org, region, domain, tags, peerIp, version, 
 }
 
 /** The records the copy's domain needs, all DNS only (never proxied). */
-export function dnsRecords({ domain, names, backendV4, backendV6, mxV4, acmeTarget, provider = [] }) {
+export function dnsRecords({ domain, names, backendV4, backendV6, mxV4, acmeTarget, gitAcmeTarget, provider = [] }) {
   return [
     { name: domain, type: 'A', value: backendV4, why: 'the Workspace' },
     { name: domain, type: 'AAAA', value: backendV6, why: 'the Workspace' },
@@ -513,6 +513,9 @@ export function dnsRecords({ domain, names, backendV4, backendV6, mxV4, acmeTarg
     { name: `git.${domain}`, type: 'CNAME', value: `${names.git}.fly.dev`, why: 'the code host' },
     { name: `*.${domain}`, type: 'CNAME', value: `${names.router}.fly.dev`, why: 'previews and sites' },
     { name: `_acme-challenge.${domain}`, type: 'CNAME', value: acmeTarget, why: 'the certificate for previews and sites' },
+    // The code host's certificate can be proved by DNS too, from the start,
+    // instead of only through the sleeping code host itself.
+    ...(gitAcmeTarget ? [{ name: `_acme-challenge.git.${domain}`, type: 'CNAME', value: gitAcmeTarget, why: 'the certificate for the code host, proved by DNS' }] : []),
     { name: `_dmarc.${domain}`, type: 'TXT', value: 'v=DMARC1; p=quarantine', why: 'mail that is not ours goes to spam' },
     ...provider,
   ];
@@ -524,6 +527,18 @@ export function formatRecords(records) {
     const value = record.type === 'MX' ? `${record.priority} ${record.value}` : record.type === 'TXT' ? q(record.value) : record.value;
     return `  ${record.name.padEnd(width)}  ${record.type.padEnd(5)}  ${value}`;
   }).join('\n');
+}
+
+/** Where Fly wants the code host's DNS-validation record to point (the
+ *  `_acme-challenge.git.` CNAME), as `fly certs show` reports it for that
+ *  name; null when Fly gives none. Only reads. */
+export async function gitAcmeTargetOf(fly, names, domain) {
+  try {
+    const cert = JSON.parse(await fly(['certs', 'show', `git.${domain}`, '-a', names.git, '--json']));
+    return bareHost(cert.dns_requirements?.acme_challenge?.target) || null;
+  } catch {
+    return null;
+  }
 }
 
 /** One record as --json shows it: exactly what to add, and why. */
@@ -987,6 +1002,7 @@ export async function install(options, deps = {}) {
     }
     const wildcard = JSON.parse(await fly(['certs', 'show', `*.${domain}`, '-a', names.router, '--json']));
     state.acmeTarget = bareHost(wildcard.dns_requirements?.acme_challenge?.target);
+    state.gitAcmeTarget = await gitAcmeTargetOf(fly, names, domain);
     const backendIps = await ips(names.backend);
     state.backendV4 = backendIps.find((ip) => ip.Type === 'shared_v4' || ip.Type === 'v4')?.Address;
     state.backendV6 = backendIps.find((ip) => ip.Type === 'v6')?.Address;
@@ -1016,8 +1032,14 @@ export async function install(options, deps = {}) {
     save();
   }
 
+  // An install begun before the installer asked for it reads it now.
+  if (!state.gitAcmeTarget) {
+    state.gitAcmeTarget = await gitAcmeTargetOf(fly, names, domain);
+    save();
+  }
+  if (!state.gitAcmeTarget && !state.steps.dns) log(`        Fly gave no DNS-validation record for git.${domain}; its certificate is proved through the code host alone.`);
   const records = dnsRecords({
-    domain, names, backendV4: state.backendV4, backendV6: state.backendV6, mxV4: state.mxV4, acmeTarget: state.acmeTarget, provider: state.sending?.records,
+    domain, names, backendV4: state.backendV4, backendV6: state.backendV6, mxV4: state.mxV4, acmeTarget: state.acmeTarget, gitAcmeTarget: state.gitAcmeTarget, provider: state.sending?.records,
   });
   await step('dns', 'Waiting for the DNS records, the certificates and the mail domain', async () => {
     log(`\n  Add these ${records.length} records at ${domain}'s DNS provider, all DNS only (not proxied):\n\n${formatRecords(records)}\n`);
@@ -1503,7 +1525,9 @@ export async function plan(options, deps = {}) {
   const monthlyUsd = cents(creates.reduce((sum, item) => sum + (item.exists ? 0 : item.monthlyUsd ?? 0), 0));
   const unknown = '(given once the install has it)';
   const records = names && domainOk
-    ? dnsRecords({ domain, names, backendV4: unknown, backendV6: unknown, mxV4: unknown, acmeTarget: '(given by Fly with the certificate)' }).map(publicRecord)
+    ? dnsRecords({
+      domain, names, backendV4: unknown, backendV6: unknown, mxV4: unknown, acmeTarget: '(given by Fly with the certificate)', gitAcmeTarget: '(given by Fly with the certificate)',
+    }).map(publicRecord)
     : [];
 
   const problems = checks.filter((item) => !item.ok);
@@ -1584,8 +1608,23 @@ export async function status(options, deps = {}) {
     return finish('continue', EXIT.done, `Nothing for a person yet: the install has not asked for its DNS records. Run the same install command again: it carries on at "${nextStep}".`, { next: 'install' });
   }
 
+  const bin = deps.flyctl ?? findFlyctl();
+  if (!bin) throw new Error('flyctl is not installed. Install it (fly.io/docs/flyctl/install) and run this again.');
+  let token = deps.token ?? process.env.FLY_API_TOKEN ?? '';
+  const fly = deps.fly ?? ((args, opts) => flyRunner({ bin, token })(args, opts));
+  if (!token) token = (await fly(['auth', 'token'], { quiet: true }).catch(() => '')).trim();
+  if (!token) throw new PersonNeeded('fly-sign-in', NO_TOKEN);
+
   const records = dnsRecords({
-    domain, names, backendV4: state.backendV4, backendV6: state.backendV6, mxV4: state.mxV4, acmeTarget: state.acmeTarget, provider: state.sending?.records,
+    domain,
+    names,
+    backendV4: state.backendV4,
+    backendV6: state.backendV6,
+    mxV4: state.mxV4,
+    acmeTarget: state.acmeTarget,
+    // Read, never written back: status changes nothing, not even its record.
+    gitAcmeTarget: state.gitAcmeTarget || await gitAcmeTargetOf(fly, names, domain),
+    provider: state.sending?.records,
   });
   const { resolver } = await (deps.authoritativeResolver ?? authoritativeResolver)(domain);
   const missing = [];
@@ -1594,13 +1633,6 @@ export async function status(options, deps = {}) {
     if (!ok) missing.push({ ...publicRecord(record), seen });
   }
   log(`  DNS: ${records.length - missing.length} of ${records.length} records right${missing.length ? `; missing:\n${formatRecords(missing)}` : ''}`);
-
-  const bin = deps.flyctl ?? findFlyctl();
-  if (!bin) throw new Error('flyctl is not installed. Install it (fly.io/docs/flyctl/install) and run this again.');
-  let token = deps.token ?? process.env.FLY_API_TOKEN ?? '';
-  const fly = deps.fly ?? ((args, opts) => flyRunner({ bin, token })(args, opts));
-  if (!token) token = (await fly(['auth', 'token'], { quiet: true }).catch(() => '')).trim();
-  if (!token) throw new PersonNeeded('fly-sign-in', NO_TOKEN);
   const certificates = {};
   for (const [app, host] of [[names.backend, domain], [names.git, `git.${domain}`], [names.router, `*.${domain}`]]) {
     try {
