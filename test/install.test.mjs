@@ -546,6 +546,24 @@ describe('driven by an agent: a plan, JSON, and when a person is needed', () => 
     expect(writes(h.fly.calls)).toEqual([]);
   });
 
+  it('plans before the update key and licence arrive, given a prefix, and says the key is what is missing', async () => {
+    const h = harness();
+    const { 'key-file': _key, 'licence-file': _licence, ...without } = h.options;
+    const result = await installer.plan({ ...without, name: 'theirco' }, h.deps);
+    expect(result.exitCode).toBe(3);
+    expect(result.reason).toBe('update-key');
+    expect(result.checks.filter((check) => !check.ok).map((check) => `${check.who} ${check.reason}`)).toEqual(['person update-key', 'person licence']);
+    // Everything else is still checked, and the plan is still shown.
+    for (const key of ['node', 'domain', 'flyctl', 'fly-sign-in', 'fly-organization', 'apps']) {
+      expect(result.checks.find((check) => check.key === key)?.ok, key).toBe(true);
+    }
+    expect(result.creates.filter((item) => item.kind === 'app')).toHaveLength(5);
+    expect(result.monthlyUsd).toBe(21.5);
+    expect(result.records).toHaveLength(9);
+    expect(result.release).toBe(null);
+    expect(writes(h.fly.calls)).toEqual([]);
+  });
+
   it('without --org, lists the organizations the sign-in reaches for the person to choose', async () => {
     const h = harness();
     const { org: _org, ...noOrg } = h.options;
